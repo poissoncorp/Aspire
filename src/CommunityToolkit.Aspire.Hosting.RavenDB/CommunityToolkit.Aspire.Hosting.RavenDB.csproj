@@ -14,6 +14,9 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Tests" />
+    <!-- Sibling packages released together with this one plug their publish strategies into the server resource. -->
+    <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Cloud" />
+    <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.Tests" />
   </ItemGroup>
 
 </Project>

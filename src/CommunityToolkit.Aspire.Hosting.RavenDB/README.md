@@ -54,6 +54,20 @@ var db = builder.AddRavenDB("ravendb")
 
 `WithLicense(parameter)` keeps the license out of the published files: Docker Compose gets a `${RAVENDB_LICENSE}` placeholder backed by `.env`, Kubernetes a `Secret`. A license passed as a string through `RavenDBServerSettings.WithLicense(...)` is written in plain text, and `aspire publish` warns about it.
 
+### Existing server
+
+`PublishAsExisting(url)` deploys nothing for the server: in the published artifacts its consumers connect to an existing RavenDB server, while `aspire run` keeps the local container. Use it for a server that lives independently of the AppHost, such as a shared cluster or one managed through GitOps.
+
+```csharp
+var url = builder.AddParameter("ravendb-url");
+
+var db = builder.AddRavenDB("ravendb")
+    .PublishAsExisting(url)
+    .AddDatabase("mydb");
+```
+
+Databases declared with `ensureCreated` are not created on an existing server.
+
 ### Checks at publish time
 
 `aspire publish` stops before writing any file when:

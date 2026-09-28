@@ -45,9 +45,20 @@ internal static partial class RavenDBPublishing
         {
             var composeEnvironments = @event.Model.Resources.OfType<DockerComposeEnvironmentResource>().ToList();
 
-            if (composeEnvironments.Count > 0)
+            if (composeEnvironments.Count == 0)
+            {
+                return Task.CompletedTask;
+            }
+
+            if (builder.Resource.ExternalUrl is null)
             {
                 ConfigureDockerCompose(builder, @event.Model, composeEnvironments);
+            }
+            else
+            {
+                // Published as external (existing server, RavenDB Cloud, operator): there is no service to wait for.
+                // WaitFor(...) would otherwise leave a depends_on entry that `docker compose up` rejects.
+                RemoveDependenciesOnServer(builder, @event.Model);
             }
 
             return Task.CompletedTask;
@@ -135,6 +146,28 @@ internal static partial class RavenDBPublishing
         {
             builder.ApplicationBuilder.CreateResourceBuilder(environment)
                 .ConfigureComposeFile(file => AddBootstrapService(file, server, targetPort));
+        }
+    }
+
+    private static void RemoveDependenciesOnServer(IResourceBuilder<RavenDBServerResource> builder, DistributedApplicationModel model)
+    {
+        var server = builder.Resource;
+
+        foreach (var dependent in model.Resources.OfType<IComputeResource>())
+        {
+            if (ReferenceEquals(dependent, server) || !WaitsFor(dependent, server))
+            {
+                continue;
+            }
+
+            builder.ApplicationBuilder.CreateResourceBuilder(dependent)
+                .PublishAsDockerComposeService((_, service) =>
+                {
+                    foreach (var name in service.DependsOn.Keys.Where(k => string.Equals(k, server.Name, StringComparison.OrdinalIgnoreCase)).ToList())
+                    {
+                        service.DependsOn.Remove(name);
+                    }
+                });
         }
     }
 
@@ -239,6 +272,12 @@ internal static partial class RavenDBPublishing
 
     internal static void Validate(RavenDBServerResource server, ILogger logger)
     {
+        if (server.ExternalUrl is not null)
+        {
+            ValidateExternal(server, logger);
+            return;
+        }
+
         var endpoints = server.Annotations.OfType<EndpointAnnotation>().ToList();
 
         if (!server.IsSecured && endpoints.Any(e => e.IsExternal))
@@ -287,6 +326,18 @@ internal static partial class RavenDBPublishing
                 "at the configured path (for example through WithBindMount), and databases declared with " +
                 "ensureCreated are not created in deployed environments yet.",
                 server.Name);
+        }
+    }
+
+    private static void ValidateExternal(RavenDBServerResource server, ILogger logger)
+    {
+        if (server.DatabasesToCreate.Count > 0 && !server.CreatesDatabasesWhenExternal)
+        {
+            logger.LogWarning(
+                "RavenDB server '{Server}' is published as an existing server, so the databases declared with " +
+                "ensureCreated ({Databases}) are not created by the deployment. Create them on that server beforehand.",
+                server.Name,
+                string.Join(", ", server.DatabasesToCreate));
         }
     }
 

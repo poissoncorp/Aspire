@@ -23,6 +23,9 @@ namespace Aspire.Hosting
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> AddRavenDB(this IDistributedApplicationBuilder builder, string name) { throw null; }
 
         [AspireExport]
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> PublishAsExisting(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> url) { throw null; }
+
+        [AspireExport]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> WithDataBindMount(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, string source, bool isReadOnly = false) { throw null; }
 
         [AspireExport]

@@ -408,6 +408,35 @@ public static class RavenDBBuilderExtensions
     }
 
     /// <summary>
+    /// Deploys nothing for this server: in the published artifacts its consumers connect to an existing RavenDB
+    /// server at <paramref name="url"/> instead. <c>aspire run</c> still starts the local container.
+    /// </summary>
+    /// <remarks>
+    /// Use it for a server that exists independently of this AppHost (a shared cluster, one run by another team or
+    /// managed through GitOps). Databases declared with <c>ensureCreated</c> are not created on it.
+    /// </remarks>
+    /// <param name="builder">The resource builder for the RavenDB server.</param>
+    /// <param name="url">A parameter holding the server URL, for example <c>https://a.ravendb.example.com</c>.</param>
+    /// <returns>The <see cref="IResourceBuilder{T}"/> for the RavenDB server resource.</returns>
+    [AspireExport]
+    public static IResourceBuilder<RavenDBServerResource> PublishAsExisting(
+        this IResourceBuilder<RavenDBServerResource> builder,
+        IResourceBuilder<ParameterResource> url)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(url);
+
+        if (!builder.ApplicationBuilder.ExecutionContext.IsPublishMode)
+        {
+            return builder;
+        }
+
+        builder.Resource.PublishAsExternal(ReferenceExpression.Create($"{url.Resource}"));
+
+        return builder.ExcludeFromManifest();
+    }
+
+    /// <summary>
     /// Adds a bind mount for the data folder to a RavenDB container resource.
     /// </summary>
     /// <param name="builder">The resource builder for the RavenDB server.</param>

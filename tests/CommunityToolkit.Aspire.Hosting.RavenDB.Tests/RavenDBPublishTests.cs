@@ -175,6 +175,88 @@ public class RavenDBPublishTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task ComposePublishAsExistingDeploysNoServerAndPointsConsumersAtTheUrl()
+    {
+        using var tempDir = new TempDirectory();
+        using var builder = CreateForPublish(tempDir.Path);
+        var logs = CaptureLogs(builder);
+
+        builder.Configuration["Parameters:ravendb-url"] = "https://a.ravendb.example.com";
+        builder.AddDockerComposeEnvironment("compose");
+        var url = builder.AddParameter("ravendb-url");
+        var ravendb = builder.AddRavenDB("ravendb").WithDataVolume().PublishAsExisting(url);
+        var orders = ravendb.AddDatabase("orders", ensureCreated: true);
+
+        builder.AddContainer("consumer", "busybox")
+            .WithReference(orders)
+            .WaitFor(ravendb);
+
+        using var app = builder.Build();
+        await app.RunAsync(TestContext.Current.CancellationToken);
+
+        var services = ReadComposeServices(tempDir.Path);
+
+        Assert.False(services.Children.ContainsKey(new YamlScalarNode("ravendb")));
+        Assert.False(services.Children.ContainsKey(new YamlScalarNode("ravendb-bootstrap")));
+
+        var consumer = (YamlMappingNode)services["consumer"];
+        Assert.Equal("URL=${RAVENDB_URL};Database=orders", consumer["environment"]["ConnectionStrings__orders"].ToString());
+        Assert.Equal("${RAVENDB_URL}", consumer["environment"]["ORDERS_URI"].ToString());
+        Assert.False(consumer.Children.ContainsKey(new YamlScalarNode("depends_on")));
+
+        Assert.Contains(logs.Entries, e => e.Level == LogLevel.Warning && e.Text.Contains("are not created by the deployment", StringComparison.Ordinal));
+        Assert.DoesNotContain(logs.Entries, e => e.Level >= LogLevel.Error);
+    }
+
+    [Fact]
+    public async Task KubernetesPublishAsExistingDeploysNoServer()
+    {
+        using var tempDir = new TempDirectory();
+        using var builder = CreateForPublish(tempDir.Path);
+
+        builder.Configuration["Parameters:ravendb-url"] = "https://a.ravendb.example.com";
+        builder.AddKubernetesEnvironment("k8s");
+        var ravendb = builder.AddRavenDB("ravendb").PublishAsExisting(builder.AddParameter("ravendb-url"));
+        builder.AddContainer("consumer", "busybox").WithReference(ravendb.AddDatabase("orders"));
+
+        using var app = builder.Build();
+        await app.RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.False(Directory.Exists(Path.Combine(tempDir.Path, "templates", "ravendb")));
+        Assert.Contains("ConnectionStrings__orders", File.ReadAllText(Path.Combine(tempDir.Path, "templates", "consumer", "config.yaml")));
+    }
+
+    [Fact]
+    public async Task AzureContainerAppsPublishAsExistingSucceeds()
+    {
+        using var tempDir = new TempDirectory();
+        using var builder = CreateForPublish(tempDir.Path);
+        var logs = CaptureLogs(builder);
+
+        builder.AddAzureContainerAppEnvironment("aca");
+        var ravendb = builder.AddRavenDB("ravendb").WithDataVolume().PublishAsExisting(builder.AddParameter("ravendb-url"));
+        builder.AddContainer("consumer", "busybox").WithReference(ravendb.AddDatabase("orders"));
+
+        using var app = builder.Build();
+        await app.RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain(logs.Entries, e => e.Level >= LogLevel.Error);
+        Assert.False(File.Exists(Path.Combine(tempDir.Path, "ravendb", "ravendb.bicep")));
+        Assert.Contains("ravendb_url", File.ReadAllText(Path.Combine(tempDir.Path, "consumer", "consumer.bicep")));
+    }
+
+    [Fact]
+    public void RunModeIgnoresPublishAsExisting()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Run);
+
+        var ravendb = builder.AddRavenDB("ravendb").PublishAsExisting(builder.AddParameter("ravendb-url"));
+
+        Assert.Null(ravendb.Resource.ExternalUrl);
+        Assert.DoesNotContain(ManifestPublishingCallbackAnnotation.Ignore, ravendb.Resource.Annotations);
+    }
+
+    [Fact]
     public void RunModeRegistersNoPublishingBehaviour()
     {
         using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Run);
