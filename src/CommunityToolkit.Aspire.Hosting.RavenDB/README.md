@@ -27,6 +27,42 @@ var myService = builder.AddProject<Projects.MyService>()
 
 Every database added with `AddDatabase(...)` exposes a clickable **RavenDB Studio** link in the Aspire dashboard that opens that database's Documents view directly (for example `http://localhost:9534/studio/index.html#databases/documents?&database=mydb`). The link is added automatically — no extra configuration is required. For secured servers it uses the configured public server URL.
 
+## Deployment
+
+`aspire run` starts RavenDB as a local container. `aspire publish` and `aspire deploy` add what a deployed server needs on top of Aspire's generic container mapping.
+
+### Docker Compose
+
+With a Docker Compose environment in the AppHost, the published `docker-compose.yaml` gets:
+
+- an HTTP health check on the RavenDB service (`/build/version`) for unsecured servers;
+- `condition: service_healthy` for every resource that waits for the server;
+- a one-shot `<name>-bootstrap` service that creates the databases added with `ensureCreated: true`, the same databases the AppHost creates locally. Running it again leaves existing databases untouched.
+
+```csharp
+builder.AddDockerComposeEnvironment("compose");
+
+var license = builder.AddParameter("ravendb-license", secret: true);
+
+var db = builder.AddRavenDB("ravendb")
+    .WithDataVolume()
+    .WithLicense(license)
+    .AddDatabase("mydb", ensureCreated: true);
+```
+
+### License
+
+`WithLicense(parameter)` keeps the license out of the published files: Docker Compose gets a `${RAVENDB_LICENSE}` placeholder backed by `.env`, Kubernetes a `Secret`. A license passed as a string through `RavenDBServerSettings.WithLicense(...)` is written in plain text, and `aspire publish` warns about it.
+
+### Checks at publish time
+
+`aspire publish` stops before writing any file when:
+
+- an unsecured server has an external endpoint (`WithExternalHttpEndpoints()`): an unsecured RavenDB server accepts every request that reaches it;
+- the server targets Azure Container Apps or Azure App Service with a data volume. Their only persistent storage is Azure Files over SMB or NFS, which [RavenDB does not support](https://docs.ravendb.net/7.2/start/installation/deployment-considerations). Use RavenDB Cloud for applications hosted there.
+
+For secured servers the server certificate has to be available inside the container, and databases declared with `ensureCreated` are not created in deployed environments yet.
+
 ## Additional documentation
 
 <!-- TODO: Update the link once it is created -->

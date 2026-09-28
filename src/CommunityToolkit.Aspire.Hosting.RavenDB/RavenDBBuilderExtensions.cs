@@ -67,7 +67,8 @@ public static class RavenDBBuilderExtensions
         var serverResource = new RavenDBServerResource(name, isSecured: securedSettings is not null)
         {
             PublicServerUrl = securedSettings?.PublicServerUrl,
-            ClientCertificate = securedSettings?.ClientCertificate
+            ClientCertificate = securedSettings?.ClientCertificate,
+            HasLiteralLicense = serverSettings.LicensingOptions is not null
         };
 
         return AddRavenDbInternal(builder, name, serverResource, environmentVariables, serverSettings.Port,
@@ -97,7 +98,10 @@ public static class RavenDBBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(name);
 
-        var serverResource = new RavenDBServerResource(name, secured);
+        var serverResource = new RavenDBServerResource(name, secured)
+        {
+            HasLiteralLicense = environmentVariables.ContainsKey("RAVEN_License")
+        };
 
         return AddRavenDbInternal(builder, name, serverResource, environmentVariables, port, tcpPort: null);
     }
@@ -131,7 +135,7 @@ public static class RavenDBBuilderExtensions
         var effectiveTcpPort = tcpPort ?? 38888;
         var useTcpScheme = forceTcpScheme ?? false;
         
-        return builder.AddResource(serverResource)
+        var resourceBuilder = builder.AddResource(serverResource)
             .WithEndpoint(
                 port: port,
                 targetPort: serverResource.IsSecured ? 443 : 8080,
@@ -147,6 +151,15 @@ public static class RavenDBBuilderExtensions
             .WithImageRegistry(RavenDBContainerImageTags.Registry)
             .WithEnvironment(context => ConfigureEnvironmentVariables(context, serverResource, environmentVariables))
             .WithHealthCheck(healthCheckKey);
+
+        if (builder.ExecutionContext.IsPublishMode)
+        {
+            // What a deployed server needs but Aspire's generic container mapping does not provide:
+            // a readiness signal, the declared databases and a sanity check of the configuration.
+            RavenDBPublishing.Configure(resourceBuilder);
+        }
+
+        return resourceBuilder;
     }
 
     private static Dictionary<string, object> GetEnvironmentVariablesFromServerSettings(RavenDBServerSettings serverSettings)
@@ -233,7 +246,7 @@ public static class RavenDBBuilderExtensions
         // Use the resource name as the database name if it's not provided
         databaseName ??= name;
 
-        builder.Resource.AddDatabase(name, databaseName);
+        builder.Resource.AddDatabase(name, databaseName, ensureCreated);
         var databaseResource = new RavenDBDatabaseResource(name, databaseName, builder.Resource);
 
         string? connectionString = null;
@@ -363,6 +376,35 @@ public static class RavenDBBuilderExtensions
         var uri = new Uri(endpointUrl);
         var scheme = isSecured ? Uri.UriSchemeHttps : Uri.UriSchemeHttp;
         return $"{scheme}://{uri.Authority}";
+    }
+
+    /// <summary>
+    /// Supplies the RavenDB license through a parameter, typically a secret one.
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="RavenDBServerSettings.WithLicense(string, bool)"/>, the license is not inlined into published
+    /// artifacts: Docker Compose gets a <c>${VARIABLE}</c> placeholder backed by <c>.env</c>, Kubernetes a <c>Secret</c>.
+    /// </remarks>
+    /// <param name="builder">The resource builder for the RavenDB server.</param>
+    /// <param name="license">The parameter holding the license JSON.</param>
+    /// <param name="eulaAccepted">
+    /// Whether the End User License Agreement is accepted. See <a href="https://ravendb.net/legal">https://ravendb.net/legal</a>.
+    /// </param>
+    /// <returns>The <see cref="IResourceBuilder{T}"/> for the RavenDB server resource.</returns>
+    [AspireExport]
+    public static IResourceBuilder<RavenDBServerResource> WithLicense(
+        this IResourceBuilder<RavenDBServerResource> builder,
+        IResourceBuilder<ParameterResource> license,
+        bool eulaAccepted = true)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(license);
+
+        builder.Resource.HasLiteralLicense = false;
+
+        return builder
+            .WithEnvironment("RAVEN_License", license)
+            .WithEnvironment("RAVEN_License_Eula_Accepted", eulaAccepted ? "true" : "false");
     }
 
     /// <summary>

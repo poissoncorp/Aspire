@@ -7,6 +7,7 @@
 
   <ItemGroup>
     <PackageReference Include="Aspire.Hosting" />
+    <PackageReference Include="Aspire.Hosting.Docker" />
     <PackageReference Include="AspNetCore.HealthChecks.RavenDB" />
     <PackageReference Include="MessagePack" />
   </ItemGroup>

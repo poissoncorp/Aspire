@@ -29,6 +29,9 @@ namespace Aspire.Hosting
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> WithDataVolume(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, string? name = null, bool isReadOnly = false) { throw null; }
 
         [AspireExport]
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> WithLicense(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> license, bool eulaAccepted = true) { throw null; }
+
+        [AspireExport]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> WithLogBindMount(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, string source, bool isReadOnly = false) { throw null; }
 
         [AspireExport]

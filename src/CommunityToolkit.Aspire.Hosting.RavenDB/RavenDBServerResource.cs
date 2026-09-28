@@ -83,6 +83,7 @@ public class RavenDBServerResource(string name, bool isSecured) : ContainerResou
     public ReferenceExpression UriExpression => ReferenceExpression.Create($"{(IsSecured ? "https://" : "http://")}{Host}:{Port}");
 
     private readonly Dictionary<string, string> _databases = new();
+    private readonly HashSet<string> _databasesToCreate = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Gets a read-only dictionary of databases associated with this server resource.
@@ -91,13 +92,31 @@ public class RavenDBServerResource(string name, bool isSecured) : ContainerResou
     public IReadOnlyDictionary<string, string> Databases => _databases;
 
     /// <summary>
+    /// Names of the databases declared with <c>ensureCreated: true</c>. They are created by the AppHost in run
+    /// mode and by a bootstrap workload in the published artifacts.
+    /// </summary>
+    internal IReadOnlyCollection<string> DatabasesToCreate => _databasesToCreate;
+
+    /// <summary>
+    /// Whether the license was supplied as a literal string (settings or environment dictionary), which ends up
+    /// inlined in published artifacts. Cleared by <c>WithLicense(parameter)</c>.
+    /// </summary>
+    internal bool HasLiteralLicense { get; set; }
+
+    /// <summary>
     /// Adds a database to the resource.
     /// </summary>
     /// <param name="name">The name of the resource to associate with the database.</param>
     /// <param name="databaseName">The name of the database to add.</param>
-    internal void AddDatabase(string name, string databaseName)
+    /// <param name="ensureCreated">Whether the database is created when the server starts.</param>
+    internal void AddDatabase(string name, string databaseName, bool ensureCreated)
     {
         _databases.TryAdd(name, databaseName);
+
+        if (ensureCreated)
+        {
+            _databasesToCreate.Add(databaseName);
+        }
     }
 
     IEnumerable<KeyValuePair<string, ReferenceExpression>> IResourceWithConnectionString.GetConnectionProperties()
