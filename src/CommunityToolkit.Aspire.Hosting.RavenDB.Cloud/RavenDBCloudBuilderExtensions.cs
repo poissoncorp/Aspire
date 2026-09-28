@@ -1,6 +1,7 @@
 #pragma warning disable ASPIREATS001 // AspireExport is experimental
 
 using Aspire.Hosting.ApplicationModel;
+using Aspire.Hosting.Docker;
 using Aspire.Hosting.Pipelines;
 using CommunityToolkit.Aspire.Hosting.RavenDB.Cloud;
 using Microsoft.Extensions.DependencyInjection;
@@ -27,6 +28,11 @@ public static class RavenDBCloudBuilderExtensions
     /// <para>
     /// Call <see cref="RavenDBCloudOptions.AsExisting(string)"/> for a product that is managed elsewhere (typically
     /// production): the deployment then only connects to it and fails when it does not exist.
+    /// </para>
+    /// <para>
+    /// Each resource that references the server or one of its databases gets a client certificate of its own, with
+    /// access to the databases it references only. In Docker Compose it is mounted as a file and passed to the
+    /// RavenDB client integration through <c>Aspire:RavenDB:Client:&lt;connection name&gt;:CertificatePath</c>.
     /// </para>
     /// </remarks>
     /// <param name="builder">The resource builder for the RavenDB server.</param>
@@ -57,8 +63,27 @@ public static class RavenDBCloudBuilderExtensions
             builder.ApplicationBuilder.Environment.EnvironmentName);
 
         builder.ApplicationBuilder.Services.TryAddSingleton<IRavenDBCloudApiClientFactory, RavenDBCloudApiClientFactory>();
+        builder.ApplicationBuilder.Services.TryAddSingleton<IRavenDBServerAdministrationFactory, RavenDBServerAdministrationFactory>();
 
         builder.Resource.PublishAsExternal(ReferenceExpression.Create($"{deployment.Endpoint}"), createsDatabases: !options.IsExisting);
+
+        // Every application that uses the server gets its client certificate as a file. The compose file refers to
+        // it; the deploy step issues it and writes it next to the compose file.
+        builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((@event, _) =>
+        {
+            var consumers = RavenDBCloudClientCertificates.FindConsumers(@event.Model, builder.Resource);
+
+            if (consumers.Count > 0)
+            {
+                foreach (var environment in @event.Model.Resources.OfType<DockerComposeEnvironmentResource>())
+                {
+                    builder.ApplicationBuilder.CreateResourceBuilder(environment)
+                        .ConfigureComposeFile(file => RavenDBCloudClientCertificates.AddToComposeFile(file, builder.Resource, consumers));
+                }
+            }
+
+            return Task.CompletedTask;
+        });
 
         return builder
             .WithAnnotation(deployment)
@@ -69,8 +94,9 @@ public static class RavenDBCloudBuilderExtensions
 
     /// <summary>
     /// Publishes the server to an existing RavenDB Cloud product: <c>aspire deploy</c> only connects the consumers
-    /// to it, and fails when the account has no product with that name. The product is never created, changed or
-    /// terminated. <c>aspire run</c> still starts the local container.
+    /// to it, issuing each a client certificate, and fails when the account has no product with that name. The
+    /// product and its databases are never created, changed or terminated; <c>aspire destroy</c> revokes the
+    /// certificates. <c>aspire run</c> still starts the local container.
     /// </summary>
     /// <param name="builder">The resource builder for the RavenDB server.</param>
     /// <param name="apiKey">A secret parameter holding a RavenDB Cloud API key. The key has account-owner rights.</param>

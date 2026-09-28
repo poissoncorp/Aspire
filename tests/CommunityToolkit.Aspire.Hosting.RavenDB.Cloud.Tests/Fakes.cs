@@ -1,8 +1,12 @@
 using System.Collections.Concurrent;
+using System.IO.Compression;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Aspire.Hosting.Pipelines;
+using Raven.Client.ServerWide.Operations.Certificates;
 
 namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.Tests;
 
@@ -21,6 +25,11 @@ internal sealed class FakeRavenDBCloudApi : HttpMessageHandler, IRavenDBCloudApi
     public List<string> TerminatedProductIds { get; } = [];
 
     public List<string> ApiKeys { get; } = [];
+
+    public List<string> CertificateDownloads { get; } = [];
+
+    /// <summary>The admin certificate every product hands out.</summary>
+    public byte[] AdminCertificate { get; } = TestCertificates.CreatePfx("admin");
 
     /// <summary>How many status checks a new product reports "Creating" before it becomes "Active".</summary>
     public int CreatingPolls { get; set; } = 2;
@@ -112,6 +121,16 @@ internal sealed class FakeRavenDBCloudApi : HttpMessageHandler, IRavenDBCloudApi
             });
         }
 
+        if (request.Method == HttpMethod.Get && path.StartsWith("/api/v1/products/security/certificate/", StringComparison.Ordinal))
+        {
+            lock (CertificateDownloads)
+            {
+                CertificateDownloads.Add(path.Split('/').Last());
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(TestCertificates.Bundle("admin", AdminCertificate)) };
+        }
+
         if (request.Method == HttpMethod.Get && path == "/api/v1/metadata/release-channels")
         {
             return Json(new { defaultReleaseChannel = "Stable", releaseChannels = new[] { new { name = "Stable" }, new { name = "Beta" } } });
@@ -137,6 +156,106 @@ internal sealed class FakeProduct(string id, string name)
     public string[] NodeTags { get; set; } = ["A"];
 
     public int Polls { get; set; }
+}
+
+/// <summary>
+/// An in-memory RavenDB server with the certificate and database operations a deployment performs.
+/// </summary>
+internal sealed class FakeRavenDBServer : IRavenDBServerAdministrationFactory
+{
+    public HashSet<string> Databases { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public Dictionary<string, FakeCertificate> Certificates { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public List<string> DeletedThumbprints { get; } = [];
+
+    public List<string> EditedThumbprints { get; } = [];
+
+    /// <summary>URL and admin certificate thumbprint of every connection.</summary>
+    public List<(string Url, string? CertificateThumbprint)> Connections { get; } = [];
+
+    public IRavenDBServerAdministration Create(string url, X509Certificate2? certificate)
+    {
+        Connections.Add((url, certificate?.Thumbprint));
+        certificate?.Dispose();
+
+        return new Session(this);
+    }
+
+    private sealed class Session(FakeRavenDBServer server) : IRavenDBServerAdministration
+    {
+        public Task<bool> DatabaseExistsAsync(string database, CancellationToken cancellationToken) =>
+            Task.FromResult(server.Databases.Contains(database));
+
+        public Task<bool> CreateDatabaseAsync(string database, int replicationFactor, CancellationToken cancellationToken) =>
+            Task.FromResult(server.Databases.Add(database));
+
+        public Task<IReadOnlyDictionary<string, DatabaseAccess>?> GetCertificatePermissionsAsync(string thumbprint, CancellationToken cancellationToken) =>
+            Task.FromResult(server.Certificates.TryGetValue(thumbprint, out var certificate)
+                ? (IReadOnlyDictionary<string, DatabaseAccess>?)new Dictionary<string, DatabaseAccess>(certificate.Permissions)
+                : null);
+
+        public Task<byte[]> CreateClientCertificateAsync(string name, IReadOnlyDictionary<string, DatabaseAccess> permissions, CancellationToken cancellationToken)
+        {
+            var pfx = TestCertificates.CreatePfx(name);
+            server.Certificates[RavenDBCloudProvisioner.GetThumbprint(pfx)] = new FakeCertificate(name, new Dictionary<string, DatabaseAccess>(permissions));
+
+            return Task.FromResult(TestCertificates.Bundle(name, pfx));
+        }
+
+        public Task SetCertificatePermissionsAsync(string thumbprint, string name, IReadOnlyDictionary<string, DatabaseAccess> permissions, CancellationToken cancellationToken)
+        {
+            server.EditedThumbprints.Add(thumbprint);
+            server.Certificates[thumbprint] = new FakeCertificate(name, new Dictionary<string, DatabaseAccess>(permissions));
+
+            return Task.CompletedTask;
+        }
+
+        public Task DeleteCertificateAsync(string thumbprint, CancellationToken cancellationToken)
+        {
+            server.DeletedThumbprints.Add(thumbprint);
+            server.Certificates.Remove(thumbprint);
+
+            return Task.CompletedTask;
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+}
+
+internal sealed record FakeCertificate(string Name, Dictionary<string, DatabaseAccess> Permissions);
+
+internal static class TestCertificates
+{
+    public static byte[] CreatePfx(string name)
+    {
+        using var key = RSA.Create(2048);
+        var request = new CertificateRequest($"CN={name}", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
+
+        return certificate.Export(X509ContentType.Pfx);
+    }
+
+    /// <summary>The zip RavenDB and RavenDB Cloud return: the pfx next to the PEM files.</summary>
+    public static byte[] Bundle(string name, byte[] pfx)
+    {
+        using var zip = new MemoryStream();
+
+        using (var archive = new ZipArchive(zip, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            using (var pem = archive.CreateEntry($"{name}.crt").Open())
+            {
+                pem.Write("-----BEGIN CERTIFICATE-----"u8);
+            }
+
+            using var entry = archive.CreateEntry($"{name}.pfx").Open();
+            entry.Write(pfx);
+        }
+
+        return zip.ToArray();
+    }
 }
 
 internal sealed class InMemoryDeploymentStateManager : IDeploymentStateManager

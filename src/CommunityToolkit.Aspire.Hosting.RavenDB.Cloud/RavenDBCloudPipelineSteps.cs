@@ -1,4 +1,5 @@
 using Aspire.Hosting.ApplicationModel;
+using Aspire.Hosting.Docker;
 using Aspire.Hosting.Pipelines;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -17,6 +18,8 @@ internal static class RavenDBCloudPipelineSteps
     public static string DatabasesStepName(RavenDBServerResource server) => $"ravendb-cloud-databases-{server.Name}";
 
     public static string ConfigureStepName(RavenDBServerResource server) => $"ravendb-cloud-configure-{server.Name}";
+
+    public static string CertificatesStepName(RavenDBServerResource server) => $"ravendb-cloud-certificates-{server.Name}";
 
     public static string DestroyStepName(RavenDBServerResource server) => $"ravendb-cloud-destroy-{server.Name}";
 
@@ -65,6 +68,17 @@ internal static class RavenDBCloudPipelineSteps
         configure.DependsOn(provision);
         configure.RequiredBy(WellKnownPipelineSteps.Deploy);
 
+        var certificates = new PipelineStep
+        {
+            Name = CertificatesStepName(server),
+            Description = $"Issues a client certificate to each application that uses '{server.Name}'",
+            Resource = server,
+            Action = context => IssueClientCertificatesAsync(deployment, context),
+        };
+        // After the databases: both use the admin certificate, which is downloaded once.
+        certificates.DependsOn(databases);
+        certificates.RequiredBy(WellKnownPipelineSteps.Deploy);
+
         var destroy = new PipelineStep
         {
             Name = DestroyStepName(server),
@@ -79,7 +93,7 @@ internal static class RavenDBCloudPipelineSteps
         destroy.DependsOn(WellKnownPipelineSteps.DestroyPrereq);
         destroy.RequiredBy(WellKnownPipelineSteps.Destroy);
 
-        return [provision, databases, configure, destroy];
+        return [provision, databases, configure, certificates, destroy];
     }
 
     /// <summary>
@@ -90,6 +104,7 @@ internal static class RavenDBCloudPipelineSteps
         var server = deployment.Server;
         var provision = context.Steps.FirstOrDefault(s => s.Name == ProvisionStepName(server));
         var configure = context.Steps.FirstOrDefault(s => s.Name == ConfigureStepName(server));
+        var certificates = context.Steps.FirstOrDefault(s => s.Name == CertificatesStepName(server));
         var destroy = context.Steps.FirstOrDefault(s => s.Name == DestroyStepName(server));
 
         // The API key is a parameter; it is resolved (or prompted for) by process-parameters.
@@ -102,15 +117,18 @@ internal static class RavenDBCloudPipelineSteps
         foreach (var environment in context.Model.Resources.OfType<IComputeEnvironmentResource>())
         {
             // Docker Compose writes its environment files in prepare-{env} and uses them in docker-compose-up-{env}:
-            // the product URL has to land in between.
+            // the product URL and the certificate files have to land in between.
             var prepareName = $"prepare-{environment.Name}";
 
-            if (configure is not null && context.Steps.Any(s => s.Name == prepareName))
+            if (context.Steps.Any(s => s.Name == prepareName))
             {
-                configure.DependsOn(prepareName);
+                configure?.DependsOn(prepareName);
+                certificates?.DependsOn(prepareName);
             }
 
-            context.Steps.FirstOrDefault(s => s.Name == $"docker-compose-up-{environment.Name}")?.DependsOn(ConfigureStepName(server));
+            var composeUp = context.Steps.FirstOrDefault(s => s.Name == $"docker-compose-up-{environment.Name}");
+            composeUp?.DependsOn(ConfigureStepName(server));
+            composeUp?.DependsOn(CertificatesStepName(server));
 
             // Stop the application before the product goes away.
             var composeDownName = $"destroy-compose-{environment.Name}";
@@ -160,9 +178,7 @@ internal static class RavenDBCloudPipelineSteps
 
         foreach (var environment in environments)
         {
-            var directory = environments.Count > 1
-                ? outputService.GetOutputDirectory(environment)
-                : outputService.GetOutputDirectory();
+            var directory = GetOutputDirectory(outputService, environment, environments.Count);
 
             foreach (var fileName in new[] { ".env", $".env.{environmentName}" })
             {
@@ -196,6 +212,64 @@ internal static class RavenDBCloudPipelineSteps
         }
     }
 
+    /// <summary>
+    /// Issues the client certificates of the applications deployed to Docker Compose, which mounts them from the
+    /// directory next to the compose file.
+    /// </summary>
+    private static async Task IssueClientCertificatesAsync(RavenDBCloudDeployment deployment, PipelineStepContext context)
+    {
+        var server = deployment.Server;
+        var environments = context.Model.Resources.OfType<IComputeEnvironmentResource>().ToList();
+        var outputService = context.Services.GetRequiredService<IPipelineOutputService>();
+        var hostEnvironment = context.Services.GetService<IHostEnvironment>();
+        var environmentName = hostEnvironment?.EnvironmentName ?? "Production";
+        var requests = new List<ClientCertificateRequest>();
+
+        foreach (var consumer in RavenDBCloudClientCertificates.FindConsumers(context.Model, server))
+        {
+            var target = consumer.Resource.Annotations.OfType<DeploymentTargetAnnotation>().FirstOrDefault()?.ComputeEnvironment;
+
+            if (target is not DockerComposeEnvironmentResource)
+            {
+                if (target is not null)
+                {
+                    context.Logger.LogWarning(
+                        "'{Resource}' is deployed to '{Environment}', which does not get a RavenDB client certificate from this " +
+                        "integration. Provide one for '{Server}' through Aspire:RavenDB:Client:{Connection}:CertificatePath.",
+                        consumer.Resource.Name,
+                        target.Name,
+                        server.Name,
+                        consumer.ConnectionNames[0]);
+                }
+
+                continue;
+            }
+
+            if (consumer.Databases.Count == 0)
+            {
+                context.Logger.LogWarning(
+                    "'{Resource}' references '{Server}', which declares no database: its certificate grants access to no " +
+                    "database. Declare the databases with AddDatabase(...).",
+                    consumer.Resource.Name,
+                    server.Name);
+            }
+
+            var directory = Path.Combine(GetOutputDirectory(outputService, target, environments.Count), RavenDBCloudClientCertificates.DirectoryName);
+
+            requests.Add(new ClientCertificateRequest(
+                consumer.Resource.Name,
+                $"aspire.{hostEnvironment?.ApplicationName ?? "apphost"}.{environmentName}.{consumer.Resource.Name}".ToLowerInvariant(),
+                consumer.Databases,
+                Path.Combine(directory, RavenDBCloudClientCertificates.FileName(server, consumer.Resource))));
+        }
+
+        using var client = await CreateClientAsync(deployment, context).ConfigureAwait(false);
+        await CreateProvisioner(client, context).EnsureClientCertificatesAsync(deployment, requests, context.CancellationToken).ConfigureAwait(false);
+    }
+
+    private static string GetOutputDirectory(IPipelineOutputService outputService, IComputeEnvironmentResource environment, int environmentCount) =>
+        environmentCount > 1 ? outputService.GetOutputDirectory(environment) : outputService.GetOutputDirectory();
+
     /// <summary>How Docker Compose names the variable of a value expression: <c>{ravendb.url}</c> is <c>RAVENDB_URL</c>.</summary>
     internal static string ToEnvironmentVariableName(string valueExpression) =>
         valueExpression
@@ -219,5 +293,9 @@ internal static class RavenDBCloudPipelineSteps
     }
 
     private static RavenDBCloudProvisioner CreateProvisioner(RavenDBCloudApiClient client, PipelineStepContext context) =>
-        new(client, context.Services.GetRequiredService<IDeploymentStateManager>(), context.Logger);
+        new(
+            client,
+            context.Services.GetRequiredService<IDeploymentStateManager>(),
+            context.Services.GetRequiredService<IRavenDBServerAdministrationFactory>(),
+            context.Logger);
 }

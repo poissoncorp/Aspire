@@ -36,11 +36,51 @@ public class RavenDBCloudPublishTests
             Assert.Contains("ConnectionStrings__orders: \"URL=${RAVENDB_URL};Database=orders\"", compose);
             Assert.DoesNotContain("depends_on", compose);
             Assert.Contains("RAVENDB_URL=", File.ReadAllText(Path.Combine(output.FullName, ".env")));
+
+            // The client certificate is a file the deploy step writes next to the compose file.
+            Assert.Contains("Aspire__RavenDB__Client__orders__CertificatePath: \"/run/secrets/ravendb-ravendb.pfx\"", compose);
+            Assert.Contains("""
+                    secrets:
+                      - source: "ravendb-ravendb-consumer-certificate"
+                        target: "ravendb-ravendb.pfx"
+                """.ReplaceLineEndings("\n"), compose.ReplaceLineEndings("\n"));
+            Assert.Contains("""
+                secrets:
+                  ravendb-ravendb-consumer-certificate:
+                    file: "./ravendb-certs/ravendb-consumer.pfx"
+                """.ReplaceLineEndings("\n"), compose.ReplaceLineEndings("\n"));
         }
         finally
         {
             output.Delete(recursive: true);
         }
+    }
+
+    [Fact]
+    public void ConsumersAreTheResourcesThatReferenceTheServerOrItsDatabases()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+
+        var server = builder.AddRavenDB("ravendb");
+        var orders = server.AddDatabase("orders");
+        server.AddDatabase("reports", "reports-db");
+        var other = builder.AddRavenDB("other").AddDatabase("audit");
+
+        builder.AddContainer("api", "busybox").WithReference(orders).WithReference(other);
+        builder.AddContainer("worker", "busybox").WithReference(server);
+        builder.AddContainer("unrelated", "busybox").WithReference(other);
+
+        var consumers = RavenDBCloudClientCertificates
+            .FindConsumers(new DistributedApplicationModel(builder.Resources), server.Resource)
+            .ToDictionary(c => c.Resource.Name);
+
+        Assert.Equal(["api", "worker"], consumers.Keys.Order());
+        Assert.Equal(["orders"], consumers["api"].ConnectionNames);
+        Assert.Equal(["orders"], consumers["api"].Databases);
+
+        // A reference to the server reaches every database declared on it.
+        Assert.Equal(["ravendb"], consumers["worker"].ConnectionNames);
+        Assert.Equal(["orders", "reports-db"], consumers["worker"].Databases);
     }
 
     [Fact]
@@ -95,6 +135,8 @@ public class RavenDBCloudPublishTests
 
         Assert.Contains("ravendb-cloud-provision-ravendb", steps["ravendb-cloud-databases-ravendb"].DependsOnSteps);
         Assert.Contains("ravendb-cloud-provision-ravendb", steps["ravendb-cloud-configure-ravendb"].DependsOnSteps);
+        Assert.Contains("ravendb-cloud-databases-ravendb", steps["ravendb-cloud-certificates-ravendb"].DependsOnSteps);
+        Assert.Contains(WellKnownPipelineSteps.Deploy, steps["ravendb-cloud-certificates-ravendb"].RequiredBySteps);
 
         var destroy = steps["ravendb-cloud-destroy-ravendb"];
         Assert.Contains(WellKnownPipelineSteps.DestroyPrereq, destroy.DependsOnSteps);
@@ -131,7 +173,9 @@ public class RavenDBCloudPublishTests
 
         Assert.Contains(WellKnownPipelineSteps.ProcessParameters, steps["ravendb-cloud-provision-ravendb"].DependsOnSteps);
         Assert.Contains("prepare-compose", steps["ravendb-cloud-configure-ravendb"].DependsOnSteps);
+        Assert.Contains("prepare-compose", steps["ravendb-cloud-certificates-ravendb"].DependsOnSteps);
         Assert.Contains("ravendb-cloud-configure-ravendb", steps["docker-compose-up-compose"].DependsOnSteps);
+        Assert.Contains("ravendb-cloud-certificates-ravendb", steps["docker-compose-up-compose"].DependsOnSteps);
         Assert.Contains("ravendb-cloud-provision-ravendb", steps["provision-api-containerapp"].DependsOnSteps);
 
         // The application stops before the product is terminated.

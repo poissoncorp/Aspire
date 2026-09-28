@@ -32,6 +32,9 @@ internal sealed class RavenDBCloudDeployment : IResourceAnnotation
     /// <summary>Id of the product, known once the provisioning step has run.</summary>
     public string? ProductId { get; set; }
 
+    /// <summary>The product's admin certificate (pfx), downloaded by the first step that needs it.</summary>
+    public byte[]? AdminCertificate { get; set; }
+
     /// <summary>Nodes in the product's cluster; used as the replication factor of new databases.</summary>
     public int NodeCount { get; set; } = 1;
 
