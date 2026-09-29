@@ -37,7 +37,8 @@ public sealed class RavenDBClusterOptions
 
     /// <summary>
     /// Gets or sets the ingress controller the operator publishes the nodes through: <c>nginx</c>, <c>traefik</c>
-    /// or <c>haproxy</c>. The default is <c>nginx</c>.
+    /// or <c>haproxy</c>. The default is <c>nginx</c>. For <c>traefik</c> the chart also gets the routes that pass
+    /// TLS through to the nodes, on Traefik's <c>websecure</c> entry point.
     /// </summary>
     public string IngressClassName { get; set; } = "nginx";
 

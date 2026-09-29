@@ -21,6 +21,10 @@ internal static partial class RavenDBClusterPublishing
     private const string ScriptPath = "/ravendb/bootstrap/bootstrap.sh";
     private const string LicenseVariable = "RAVENDB_LICENSE";
 
+    // Ports of the Service the operator creates for each node.
+    private const int NodeHttpsPort = 443;
+    private const int NodeTcpPort = 38888;
+
     private static readonly Lazy<string> s_script = new(() =>
     {
         using var stream = typeof(RavenDBClusterPublishing).Assembly
@@ -228,6 +232,11 @@ internal static partial class RavenDBClusterPublishing
         k8s.AdditionalResources.AddRange(CreateAccess(deployment));
         k8s.AdditionalResources.Add(CreateCluster(deployment));
 
+        if (string.Equals(deployment.Options.IngressClassName, "traefik", StringComparison.OrdinalIgnoreCase))
+        {
+            k8s.AdditionalResources.Add(CreateTraefikRoutes(deployment));
+        }
+
         if (deployment.Options.LicenseSecretName is null)
         {
             k8s.AdditionalResources.Add(CreateLicenseSecret(deployment, license));
@@ -254,7 +263,7 @@ internal static partial class RavenDBClusterPublishing
                 {
                     Tag = RavenDBClusterDeployment.NodeTag(i),
                     PublicServerUrl = deployment.NodeUrls[i],
-                    PublicServerUrlTcp = $"tcp://{RavenDBClusterDeployment.NodeTag(i)}-tcp.{options.Domain}:443",
+                    PublicServerUrlTcp = $"tcp://{deployment.NodeTcpHost(i)}:443",
                 })],
                 Storage = { Data = { Size = options.StorageSize, StorageClassName = options.StorageClassName } },
                 ExternalAccessConfiguration = { IngressControllerContext = { IngressClassName = options.IngressClassName } },
@@ -263,6 +272,37 @@ internal static partial class RavenDBClusterPublishing
 
         cluster.Metadata.Name = deployment.ResourceName;
         return cluster;
+    }
+
+    /// <summary>
+    /// Traefik ignores the SSL passthrough annotations of the Ingress the operator creates, and RavenDB must see the
+    /// clients' certificates. These routes hand each connection to the node's Service untouched, picked by the host
+    /// name the client asks for, on the <c>websecure</c> entry point (port 443).
+    /// </summary>
+    private static TraefikIngressRouteTcp CreateTraefikRoutes(RavenDBClusterDeployment deployment)
+    {
+        var routes = new TraefikIngressRouteTcp
+        {
+            Spec =
+            {
+                EntryPoints = ["websecure"],
+                Routes = [.. Enumerable.Range(0, deployment.Options.Nodes).SelectMany(i => new[]
+                {
+                    Route(deployment.NodeHost(i), i, NodeHttpsPort),
+                    Route(deployment.NodeTcpHost(i), i, NodeTcpPort),
+                })],
+            },
+        };
+
+        routes.Metadata.Name = $"{deployment.ResourceName}-nodes";
+        return routes;
+
+        // The operator names each node's Service ravendb-<tag>, whatever the cluster is called.
+        static TraefikRoute Route(string host, int node, int port) => new()
+        {
+            Match = $"HostSNI(`{host}`)",
+            Services = [new TraefikRouteService { Name = $"ravendb-{RavenDBClusterDeployment.NodeTag(node)}", Port = port }],
+        };
     }
 
     private static Secret CreateLicenseSecret(RavenDBClusterDeployment deployment, (bool Encoded, string Value)? license)

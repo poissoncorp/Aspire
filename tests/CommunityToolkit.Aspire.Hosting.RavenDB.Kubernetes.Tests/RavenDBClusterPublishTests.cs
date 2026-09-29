@@ -39,6 +39,9 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         Assert.Equal("https://b.ravendb.example.test:443", nodes[1].Scalar("publicServerUrl"));
         Assert.Equal("tcp://b-tcp.ravendb.example.test:443", nodes[1].Scalar("publicServerUrlTcp"));
 
+        // nginx passes TLS through for the operator's own Ingress.
+        Assert.Empty(chart.All("IngressRouteTCP"));
+
         // A license is JSON: base64 keeps its quotes out of the quoted YAML string.
         var license = chart.Single("Secret", "ravendb-license");
         Assert.Equal("{{ .Values.secrets.ravendb_bootstrap.ravendb_license | b64enc }}", license.Scalar("data", "license.json"));
@@ -146,6 +149,36 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         var environment = container.Items("env").ToDictionary(e => e.Scalar("name")!, e => e.Scalar("value"));
         Assert.Equal("/ravendb/ravendb/client.pfx", environment["Aspire__RavenDB__Client__orders__CertificatePath"]);
         Assert.Equal("/etc/ssl/certs:/ravendb/ravendb-ca", environment["SSL_CERT_DIR"]);
+    }
+
+    [Fact]
+    public async Task TraefikPassesTlsThroughToEachNode()
+    {
+        using var chart = await Publish(builder => AddCluster(builder, cluster =>
+        {
+            cluster.Nodes = 2;
+            cluster.IngressClassName = "traefik";
+        }));
+
+        Assert.Equal("traefik", chart.Single("RavenDBCluster").Scalar("spec", "externalAccessConfiguration", "ingressControllerContext", "ingressClassName"));
+
+        var routes = chart.Single("IngressRouteTCP", "ravendb-nodes");
+        Assert.Equal("traefik.io/v1alpha1", routes.Scalar("apiVersion"));
+        Assert.Equal(["websecure"], routes.Items("spec", "entryPoints").Select(n => ((YamlScalarNode)n).Value));
+        Assert.Equal("true", routes.Scalar("spec", "tls", "passthrough"));
+
+        Assert.Equal(
+            [
+                ("HostSNI(`a.ravendb.example.test`)", "ravendb-a", "443"),
+                ("HostSNI(`a-tcp.ravendb.example.test`)", "ravendb-a", "38888"),
+                ("HostSNI(`b.ravendb.example.test`)", "ravendb-b", "443"),
+                ("HostSNI(`b-tcp.ravendb.example.test`)", "ravendb-b", "38888"),
+            ],
+            routes.Items("spec", "routes").Select(r =>
+            {
+                var service = r.Items("services").Single();
+                return (r.Scalar("match"), service.Scalar("name"), service.Scalar("port"));
+            }));
     }
 
     [Fact]

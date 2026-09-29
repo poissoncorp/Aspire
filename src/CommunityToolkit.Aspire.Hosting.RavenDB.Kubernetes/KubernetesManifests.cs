@@ -71,6 +71,42 @@ internal sealed class RavenDBClusterIngressController
 }
 
 /// <summary>
+/// A Traefik <c>IngressRouteTCP</c> (<c>traefik.io/v1alpha1</c>) that passes TLS through to the nodes.
+/// </summary>
+internal sealed class TraefikIngressRouteTcp() : BaseKubernetesResource("traefik.io/v1alpha1", "IngressRouteTCP")
+{
+    public TraefikIngressRouteTcpSpec Spec { get; set; } = new();
+}
+
+internal sealed class TraefikIngressRouteTcpSpec
+{
+    public List<string> EntryPoints { get; set; } = [];
+
+    public List<TraefikRoute> Routes { get; set; } = [];
+
+    public TraefikTls Tls { get; set; } = new();
+}
+
+internal sealed class TraefikRoute
+{
+    public string Match { get; set; } = string.Empty;
+
+    public List<TraefikRouteService> Services { get; set; } = [];
+}
+
+internal sealed class TraefikRouteService
+{
+    public string Name { get; set; } = string.Empty;
+
+    public int Port { get; set; }
+}
+
+internal sealed class TraefikTls
+{
+    public bool Passthrough { get; set; } = true;
+}
+
+/// <summary>
 /// A <c>batch/v1</c> Job. Aspire's Kubernetes publisher models Deployments and StatefulSets only, and either would
 /// restart a one-shot pod forever.
 /// </summary>

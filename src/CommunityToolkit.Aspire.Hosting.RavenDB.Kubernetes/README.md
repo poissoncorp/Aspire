@@ -7,7 +7,7 @@ Deploys the [RavenDB hosting integration](https://www.nuget.org/packages/Communi
 ### Prerequisites
 
 - The RavenDB operator installed in the cluster.
-- An ingress controller the operator can publish the nodes through (`nginx`, `traefik` or `haproxy`).
+- An ingress controller the operator can publish the nodes through (`nginx`, `traefik` or `haproxy`). Traefik does not pass TLS through for the operator's Ingress, so for `traefik` the chart adds an `IngressRouteTCP` that does, on the `websecure` entry point: Traefik needs its Kubernetes CRD provider enabled and `websecure` exposed on port 443.
 - DNS for the nodes, inside the cluster as well: node `a` is `https://a.<domain>:443`, and the operator's own bootstrap and the applications connect through those names.
 - Secrets in the target namespace, created the way the operator documents them:
 

@@ -14,8 +14,16 @@ internal sealed class RavenDBClusterDeployment(RavenDBServerResource server, Rav
     public RavenDBClusterOptions Options { get; } = options;
 
     /// <summary>Public URLs of the cluster's nodes.</summary>
-    public IReadOnlyList<string> NodeUrls { get; } =
-        [.. Enumerable.Range(0, options.Nodes).Select(i => $"https://{NodeTag(i)}.{options.Domain}:443")];
+    public IReadOnlyList<string> NodeUrls => [.. Enumerable.Range(0, Options.Nodes).Select(i => $"https://{NodeHost(i)}:443")];
+
+    /// <summary>The host name of a node's HTTPS endpoint.</summary>
+    public string NodeHost(int index) => $"{NodeTag(index)}.{Options.Domain}";
+
+    /// <summary>
+    /// The host name of a node's TCP endpoint. It shares port 443 with HTTPS: the ingress controller tells them apart
+    /// by the host name the client asks for.
+    /// </summary>
+    public string NodeTcpHost(int index) => $"{NodeTag(index)}-tcp.{Options.Domain}";
 
     /// <summary>The URL the applications connect to.</summary>
     public ReferenceExpression Url => ReferenceExpression.Create($"{NodeUrls[0]}");
