@@ -6,9 +6,9 @@ Deploys the [RavenDB hosting integration](https://www.nuget.org/packages/Communi
 
 ### Prerequisites
 
-- The RavenDB operator installed in the cluster.
+- The RavenDB operator, with cert-manager, installed once per Kubernetes cluster (see below).
 - An ingress controller the operator can publish the nodes through (`nginx`, `traefik` or `haproxy`). Traefik does not pass TLS through for the operator's Ingress, so for `traefik` the chart adds an `IngressRouteTCP` that does, on the `websecure` entry point: Traefik needs its Kubernetes CRD provider enabled and `websecure` exposed on port 443.
-- DNS for the nodes, inside the cluster as well: node `a` is `https://a.<domain>:443`, and the operator's own bootstrap and the applications connect through those names.
+- DNS for the nodes, inside the cluster as well, before the nodes start: node `a` is `https://a.<domain>:443`, and the operator's own bootstrap and the applications connect through those names. Each node checks its own URL once when it starts; with a private certificate authority, nodes that could not reach themselves reject each other until they restart.
 - Secrets in the target namespace, created the way the operator documents them:
 
 ```bash
@@ -20,6 +20,13 @@ kubectl create secret generic ravendb-ca --from-file=ca.crt=./ca.crt
 The server certificate covers every node (`*.<domain>`), the admin certificate is a client certificate the operator trusts, and the certificate authority is only needed when it is not publicly trusted.
 
 The operator reads the `.pfx` files with SHA-1 and 3DES only, which is not what OpenSSL 3 writes by default. Export them with `openssl pkcs12 -export -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1 ...`; otherwise the operator reports `pkcs12: unknown digest algorithm` and does not start the nodes.
+
+Install cert-manager and the operator outside the AppHost, once per Kubernetes cluster: the operator's chart owns the `RavenDBCluster` definition, so uninstalling it removes every RavenDB cluster in Kubernetes. This integration is tested with operator 2.0.0:
+
+```bash
+helm install cert-manager oci://quay.io/jetstack/charts/cert-manager -n cert-manager --create-namespace --set crds.enabled=true
+helm install ravendb-operator ravendb-operator --repo https://ravendb.github.io/ravendb-operator/helm --version 2.0.0 -n ravendb-operator-system --create-namespace
+```
 
 ### Install the package
 
