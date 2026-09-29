@@ -1,3 +1,7 @@
+#pragma warning disable ASPIREATS001 // AspireExport is experimental
+
+using Aspire.Hosting;
+
 namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud;
 
 /// <summary>Cloud provider a RavenDB Cloud product runs on.</summary>
@@ -43,6 +47,7 @@ public enum RavenDBCloudStorageType
 /// A product is looked up by <see cref="ProductName"/>. When it does not exist, the deployment creates it from the
 /// remaining options; options left unset are resolved from the Cloud API metadata at deploy time.
 /// </remarks>
+[AspireExport(ExposeProperties = true, ExposeMethods = true)]
 public sealed class RavenDBCloudOptions
 {
     /// <summary>
@@ -91,6 +96,7 @@ public sealed class RavenDBCloudOptions
     public string ApiEndpoint { get; set; } = "https://api.cloud.ravendb.net";
 
     /// <summary>How long a deployment waits for a new product to become active. Default: 30 minutes.</summary>
+    [AspireExportIgnore(Reason = "A TimeSpan reaches polyglot app hosts as a number without a unit.")]
     public TimeSpan ProvisioningTimeout { get; set; } = TimeSpan.FromMinutes(30);
 
     /// <summary>

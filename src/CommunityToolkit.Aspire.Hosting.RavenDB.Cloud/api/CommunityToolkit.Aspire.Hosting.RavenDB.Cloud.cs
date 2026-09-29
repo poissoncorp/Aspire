@@ -10,13 +10,14 @@ namespace Aspire.Hosting
 {
     public static partial class RavenDBCloudBuilderExtensions
     {
-        [AspireExportIgnore(Reason = "The options callback is not supported by ATS.")]
+        [AspireExport(RunSyncOnBackgroundThread = true)]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> PublishAsRavenDBCloud(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> apiKey, System.Action<CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.RavenDBCloudOptions>? configure = null) { throw null; }
     }
 }
 
 namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud
 {
+    [global::Aspire.Hosting.AspireExport(ExposeProperties = true, ExposeMethods = true)]
     public sealed partial class RavenDBCloudOptions
     {
         public System.Collections.Generic.IList<string> AllowedIps { get { throw null; } }
@@ -31,6 +32,7 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud
 
         public RavenDBCloudProvider Provider { get { throw null; } set { } }
 
+        [global::Aspire.Hosting.AspireExportIgnore(Reason = "A TimeSpan reaches polyglot app hosts as a number without a unit.")]
         public System.TimeSpan ProvisioningTimeout { get { throw null; } set { } }
 
         public string Region { get { throw null; } set { } }

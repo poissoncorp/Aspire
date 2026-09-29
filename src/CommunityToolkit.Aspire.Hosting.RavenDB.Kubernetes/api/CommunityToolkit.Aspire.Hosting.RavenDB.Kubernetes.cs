@@ -10,7 +10,7 @@ namespace Aspire.Hosting
 {
     public static partial class RavenDBClusterBuilderExtensions
     {
-        [AspireExportIgnore(Reason = "The options callback is not supported by ATS.")]
+        [AspireExport(RunSyncOnBackgroundThread = true)]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> PublishAsRavenDBCluster(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, System.Action<CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes.RavenDBClusterOptions> configure) { throw null; }
     }
 
@@ -24,6 +24,7 @@ namespace Aspire.Hosting
 
 namespace CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes
 {
+    [global::Aspire.Hosting.AspireExport(ExposeProperties = true, ExposeMethods = true)]
     public sealed partial class RavenDBClusterOptions
     {
         public string? Domain { get { throw null; } set { } }

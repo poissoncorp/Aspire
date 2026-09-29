@@ -30,7 +30,7 @@ public static class RavenDBClusterBuilderExtensions
     /// <param name="builder">The resource builder for the RavenDB server.</param>
     /// <param name="configure">Describes the cluster. <see cref="RavenDBClusterOptions.Domain"/> and the certificates are required.</param>
     /// <returns>The <see cref="IResourceBuilder{T}"/> for the RavenDB server resource.</returns>
-    [AspireExportIgnore(Reason = "The options callback is not supported by ATS.")]
+    [AspireExport(RunSyncOnBackgroundThread = true)]
     public static IResourceBuilder<RavenDBServerResource> PublishAsRavenDBCluster(
         this IResourceBuilder<RavenDBServerResource> builder,
         Action<RavenDBClusterOptions> configure)

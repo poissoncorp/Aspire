@@ -40,7 +40,7 @@ public static class RavenDBCloudBuilderExtensions
     /// <param name="apiKey">A secret parameter holding a RavenDB Cloud API key. The key has account-owner rights.</param>
     /// <param name="configure">Describes the product.</param>
     /// <returns>The <see cref="IResourceBuilder{T}"/> for the RavenDB server resource.</returns>
-    [AspireExportIgnore(Reason = "The options callback is not supported by ATS.")]
+    [AspireExport(RunSyncOnBackgroundThread = true)]
     public static IResourceBuilder<RavenDBServerResource> PublishAsRavenDBCloud(
         this IResourceBuilder<RavenDBServerResource> builder,
         IResourceBuilder<ParameterResource> apiKey,

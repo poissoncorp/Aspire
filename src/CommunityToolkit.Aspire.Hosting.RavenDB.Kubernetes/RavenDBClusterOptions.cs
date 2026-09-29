@@ -1,3 +1,7 @@
+#pragma warning disable ASPIREATS001 // AspireExport is experimental
+
+using Aspire.Hosting;
+
 namespace CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes;
 
 /// <summary>
@@ -8,6 +12,7 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes;
 /// passthrough. The node names must resolve inside the cluster as well: the operator's own bootstrap and the
 /// applications connect through them.
 /// </remarks>
+[AspireExport(ExposeProperties = true, ExposeMethods = true)]
 public sealed class RavenDBClusterOptions
 {
     /// <summary>
