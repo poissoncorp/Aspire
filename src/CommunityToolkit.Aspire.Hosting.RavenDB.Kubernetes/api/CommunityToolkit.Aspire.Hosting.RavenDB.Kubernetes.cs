@@ -10,11 +10,15 @@ namespace Aspire.Hosting
 {
     public static partial class RavenDBClusterBuilderExtensions
     {
-        [AspireExport]
-        public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> PublishAsExistingRavenDBCluster(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> url, string clientCertificateSecret, string? certificateAuthoritySecret = null) { throw null; }
-
         [AspireExportIgnore(Reason = "The options callback is not supported by ATS.")]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> PublishAsRavenDBCluster(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, System.Action<CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes.RavenDBClusterOptions> configure) { throw null; }
+    }
+
+    public static partial class RavenDBKubernetesClientCertificateExtensions
+    {
+        [AspireExport("withRavenDBDatabaseClientCertificateSecret", MethodName = "withRavenDBClientCertificateSecret")]
+        public static ApplicationModel.IResourceBuilder<T> WithRavenDBClientCertificateSecret<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBDatabaseResource> database, string secretName, string? certificateAuthoritySecret = null)
+            where T : ApplicationModel.IComputeResource { throw null; }
     }
 }
 

@@ -27,13 +27,13 @@ public static class RavenDBCloudBuilderExtensions
     /// the product without deploying the application.
     /// </para>
     /// <para>
-    /// Call <see cref="RavenDBCloudOptions.AsExisting(string)"/> for a product that is managed elsewhere (typically
-    /// production): the deployment then only connects to it and fails when it does not exist.
-    /// </para>
-    /// <para>
     /// Each resource that references the server or one of its databases gets a client certificate of its own, with
     /// access to the databases it references only. In Docker Compose it is mounted as a file and passed to the
     /// RavenDB client integration through <c>Aspire:RavenDB:Client:&lt;connection name&gt;:CertificatePath</c>.
+    /// </para>
+    /// <para>
+    /// For a product someone else owns, use <c>PublishAsExisting(url)</c> and give each application the certificate the
+    /// owner issued for it instead: the API key has account-owner rights.
     /// </para>
     /// </remarks>
     /// <param name="builder">The resource builder for the RavenDB server.</param>
@@ -74,21 +74,24 @@ public static class RavenDBCloudBuilderExtensions
         builder.ApplicationBuilder.Services.TryAddSingleton<IRavenDBCloudApiClientFactory, RavenDBCloudApiClientFactory>();
         builder.ApplicationBuilder.Services.TryAddSingleton<IRavenDBServerAdministrationFactory, RavenDBServerAdministrationFactory>();
 
-        builder.Resource.PublishAsExternal(ReferenceExpression.Create($"{deployment.Endpoint}"), createsDatabases: !options.IsExisting);
+        builder.Resource.PublishAsExternal(ReferenceExpression.Create($"{deployment.Endpoint}"), createsDatabases: true);
 
         // Every application that uses the server gets its client certificate as a file. The compose file refers to
         // it; the deploy step issues it and writes it next to the compose file.
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((@event, _) =>
         {
-            var consumers = RavenDBConsumers.Find(@event.Model, builder.Resource);
+            var consumers = RavenDBConsumers.Find(@event.Model, builder.Resource).Where(c => !c.BringsOwnCertificate).ToList();
 
-            if (consumers.Count > 0)
+            foreach (var environment in @event.Model.Resources.OfType<DockerComposeEnvironmentResource>())
             {
-                foreach (var environment in @event.Model.Resources.OfType<DockerComposeEnvironmentResource>())
+                builder.ApplicationBuilder.CreateResourceBuilder(environment).ConfigureComposeFile(file =>
                 {
-                    builder.ApplicationBuilder.CreateResourceBuilder(environment)
-                        .ConfigureComposeFile(file => RavenDBCloudClientCertificates.AddToComposeFile(file, builder.Resource, consumers));
-                }
+                    foreach (var consumer in consumers)
+                    {
+                        var certificateFile = $"./{RavenDBCloudClientCertificates.DirectoryName}/{RavenDBCloudClientCertificates.FileName(builder.Resource, consumer.Resource.Name)}";
+                        RavenDBComposeCertificates.Mount(file, builder.Resource, consumer, certificateFile);
+                    }
+                });
             }
 
             return Task.CompletedTask;
@@ -99,26 +102,5 @@ public static class RavenDBCloudBuilderExtensions
             .WithPipelineStepFactory(_ => RavenDBCloudPipelineSteps.Create(deployment))
             .WithPipelineConfiguration(context => RavenDBCloudPipelineSteps.Configure(deployment, context))
             .ExcludeFromManifest();
-    }
-
-    /// <summary>
-    /// Publishes the server to an existing RavenDB Cloud product: <c>aspire deploy</c> only connects the consumers
-    /// to it, issuing each a client certificate, and fails when the account has no product with that name. The
-    /// product and its databases are never created, changed or terminated; <c>aspire destroy</c> revokes the
-    /// certificates. <c>aspire run</c> still starts the local container.
-    /// </summary>
-    /// <param name="builder">The resource builder for the RavenDB server.</param>
-    /// <param name="apiKey">A secret parameter holding a RavenDB Cloud API key. The key has account-owner rights.</param>
-    /// <param name="productName">Display name of the product in the account.</param>
-    /// <returns>The <see cref="IResourceBuilder{T}"/> for the RavenDB server resource.</returns>
-    [AspireExport]
-    public static IResourceBuilder<RavenDBServerResource> PublishAsExistingRavenDBCloud(
-        this IResourceBuilder<RavenDBServerResource> builder,
-        IResourceBuilder<ParameterResource> apiKey,
-        string productName)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(productName);
-
-        return builder.PublishAsRavenDBCloud(apiKey, options => options.AsExisting(productName));
     }
 }

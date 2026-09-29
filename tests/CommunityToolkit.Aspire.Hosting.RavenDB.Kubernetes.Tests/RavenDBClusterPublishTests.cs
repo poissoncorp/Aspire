@@ -79,7 +79,6 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
 
         var settings = chart.Values("config", "ravendb_bootstrap");
         Assert.Equal("https://a.ravendb.example.test:443 https://b.ravendb.example.test:443 https://c.ravendb.example.test:443", settings.Scalar("RAVENDB_URLS"));
-        Assert.Equal("true", settings.Scalar("RAVENDB_WAIT_FOR_NODES"));
         Assert.Equal("orders reports", settings.Scalar("RAVENDB_DATABASES"));
         Assert.Equal("3", settings.Scalar("RAVENDB_REPLICATION_FACTOR"));
 
@@ -219,28 +218,56 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public async Task ExistingServerGetsOnlyTheApplicationCertificates()
+    public async Task ApplicationOfAnExistingServerMountsTheCertificateItsOwnerIssued()
     {
         using var chart = await Publish(builder =>
         {
             builder.Configuration["Parameters:ravendb-url"] = "https://a.ravendb.example.test:443";
-            var orders = builder.AddRavenDB("ravendb")
-                .PublishAsExistingRavenDBCluster(builder.AddParameter("ravendb-url"), "ravendb-admin", "ravendb-ca")
-                .AddDatabase("orders", ensureCreated: true);
-            builder.AddContainer("api", "busybox").WithReference(orders);
+            var orders = builder.AddRavenDB("ravendb").PublishAsExisting(builder.AddParameter("ravendb-url")).AddDatabase("orders");
+            builder.AddContainer("api", "busybox").WithReference(orders).WithRavenDBClientCertificateSecret(orders, "api-orders", "ravendb-ca");
         });
 
+        // Nothing is issued: no admin, no Job, no access to Secrets.
         Assert.Empty(chart.All("RavenDBCluster"));
-        Assert.DoesNotContain(chart.All("Secret"), s => s.Scalar("metadata", "name") == "ravendb-license");
-
-        var settings = chart.Values("config", "ravendb_bootstrap");
-        Assert.Equal("false", settings.Scalar("RAVENDB_WAIT_FOR_NODES"));
-        Assert.Equal("", settings.Scalar("RAVENDB_DATABASES"));
-        Assert.Equal("ravendb-api-client-certificate=orders", settings.Scalar("RAVENDB_APPLICATIONS"));
-        Assert.Contains("ravendb_url", chart.Single("ConfigMap", "ravendb-bootstrap-config").Scalar("data", "RAVENDB_URLS"));
+        Assert.Empty(chart.All("Job"));
+        Assert.Empty(chart.All("Role"));
 
         var pod = chart.Single("Deployment", "api-deployment").Get("spec", "template", "spec");
-        Assert.Contains("ravendb-api-client-certificate", pod.ToString());
+        var volumes = pod.Items("volumes").ToDictionary(v => v.Scalar("name")!);
+        Assert.Equal("api-orders", volumes["ravendb-client-certificate"].Scalar("secret", "secretName"));
+        Assert.Equal("ravendb-ca", volumes["ravendb-certificate-authority"].Scalar("secret", "secretName"));
+
+        var environment = pod.Items("containers")[0].Items("env").ToDictionary(e => e.Scalar("name")!, e => e.Scalar("value"));
+        Assert.Equal("/ravendb/ravendb/client.pfx", environment["Aspire__RavenDB__Client__orders__CertificatePath"]);
+        Assert.Equal("/etc/ssl/certs:/ravendb/ravendb-ca", environment["SSL_CERT_DIR"]);
+    }
+
+    [Fact]
+    public async Task BootstrapIssuesNoCertificateToAnApplicationThatBringsOne()
+    {
+        using var chart = await Publish(builder =>
+        {
+            var orders = AddCluster(builder).AddDatabase("orders");
+            builder.AddContainer("api", "busybox").WithReference(orders).WithRavenDBClientCertificateSecret(orders, "api-orders");
+            builder.AddContainer("worker", "busybox").WithReference(orders);
+        });
+
+        Assert.Equal("ravendb-worker-client-certificate=orders", chart.Values("config", "ravendb_bootstrap").Scalar("RAVENDB_APPLICATIONS"));
+
+        var api = chart.Single("Deployment", "api-deployment").Get("spec", "template", "spec");
+        Assert.Equal("api-orders", Assert.Single(api.Items("volumes"), v => v.Scalar("name") == "ravendb-client-certificate").Scalar("secret", "secretName"));
+    }
+
+    [Fact]
+    public async Task CertificateForAServerTheApplicationDoesNotReferenceIsRejected()
+    {
+        using var chart = await Publish(builder =>
+        {
+            var orders = AddCluster(builder).AddDatabase("orders");
+            builder.AddContainer("api", "busybox").WithRavenDBClientCertificateSecret(orders, "api-orders");
+        });
+
+        Assert.Contains(chart.Errors, e => e.Contains("'api' has a client certificate for RavenDB server 'ravendb' but does not reference it", StringComparison.Ordinal));
     }
 
     [Theory]
@@ -315,7 +342,7 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
         builder.AddKubernetesEnvironment("k8s");
         var server = builder.AddRavenDB("ravendb");
-        var deployment = RavenDBClusterDeployment.ForCluster(server.Resource, Options());
+        var deployment = new RavenDBClusterDeployment(server.Resource, Options());
 
         var steps = RavenDBClusterPipelineSteps.Create(deployment).ToList();
         var publish = Assert.Single(steps, s => s.Name == "ravendb-cluster-publish-ravendb");

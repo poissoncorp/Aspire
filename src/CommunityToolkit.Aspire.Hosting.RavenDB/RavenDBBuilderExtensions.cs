@@ -414,7 +414,10 @@ public static class RavenDBBuilderExtensions
     /// </summary>
     /// <remarks>
     /// Use it for a server that exists independently of this AppHost (a shared cluster, one run by another team or
-    /// managed through GitOps). Databases declared with <c>ensureCreated</c> are not created on it.
+    /// managed through GitOps). Databases declared with <c>ensureCreated</c> are not created on it. When the server is
+    /// secured, give each application the client certificate its owner issued for it, with
+    /// <c>WithRavenDBClientCertificateFile</c> (Docker Compose) or <c>WithRavenDBClientCertificateSecret</c>
+    /// (Kubernetes).
     /// </remarks>
     /// <param name="builder">The resource builder for the RavenDB server.</param>
     /// <param name="url">A parameter holding the server URL, for example <c>https://a.ravendb.example.com</c>.</param>

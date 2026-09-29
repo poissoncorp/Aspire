@@ -10,9 +10,6 @@ namespace Aspire.Hosting
 {
     public static partial class RavenDBCloudBuilderExtensions
     {
-        [AspireExport]
-        public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> PublishAsExistingRavenDBCloud(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> apiKey, string productName) { throw null; }
-
         [AspireExportIgnore(Reason = "The options callback is not supported by ATS.")]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> PublishAsRavenDBCloud(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> apiKey, System.Action<CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.RavenDBCloudOptions>? configure = null) { throw null; }
     }
@@ -47,8 +44,6 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud
         public bool TerminateOnDestroy { get { throw null; } set { } }
 
         public RavenDBCloudTier Tier { get { throw null; } set { } }
-
-        public RavenDBCloudOptions AsExisting(string productName) { throw null; }
 
         public RavenDBCloudOptions WithAllowedIps(params string[] allowedIps) { throw null; }
     }

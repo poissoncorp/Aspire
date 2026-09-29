@@ -43,6 +43,9 @@ internal static partial class RavenDBPublishing
         // writes the files.
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((@event, _) =>
         {
+            var consumers = RavenDBConsumers.Find(@event.Model, builder.Resource);
+            EnsureCertificatesAreForReferencedServers(@event.Model, builder.Resource, consumers);
+
             var composeEnvironments = @event.Model.Resources.OfType<DockerComposeEnvironmentResource>().ToList();
 
             if (composeEnvironments.Count == 0)
@@ -60,6 +63,8 @@ internal static partial class RavenDBPublishing
                 // WaitFor(...) would otherwise leave a depends_on entry that `docker compose up` rejects.
                 RemoveDependenciesOnServer(builder, @event.Model);
             }
+
+            MountBroughtCertificates(builder, consumers, composeEnvironments);
 
             return Task.CompletedTask;
         });
@@ -168,6 +173,43 @@ internal static partial class RavenDBPublishing
                         service.DependsOn.Remove(name);
                     }
                 });
+        }
+    }
+
+    /// <summary>A certificate for a server the application does not reference would be delivered to no connection.</summary>
+    private static void EnsureCertificatesAreForReferencedServers(
+        DistributedApplicationModel model,
+        RavenDBServerResource server,
+        IReadOnlyList<RavenDBConsumer> consumers)
+    {
+        foreach (var resource in model.Resources)
+        {
+            if (RavenDBConsumers.OwnCertificatesFor(resource, server).Count > 0 && consumers.All(c => !ReferenceEquals(c.Resource, resource)))
+            {
+                throw new DistributedApplicationException(
+                    $"'{resource.Name}' has a client certificate for RavenDB server '{server.Name}' but does not reference it. " +
+                    "Add WithReference(...) with the server or one of its databases.");
+            }
+        }
+    }
+
+    private static void MountBroughtCertificates(
+        IResourceBuilder<RavenDBServerResource> builder,
+        IReadOnlyList<RavenDBConsumer> consumers,
+        IReadOnlyList<DockerComposeEnvironmentResource> composeEnvironments)
+    {
+        foreach (var consumer in consumers)
+        {
+            if (consumer.OwnCertificate(RavenDBClientCertificateSource.File) is not { } certificate)
+            {
+                continue;
+            }
+
+            foreach (var environment in composeEnvironments)
+            {
+                builder.ApplicationBuilder.CreateResourceBuilder(environment)
+                    .ConfigureComposeFile(file => RavenDBComposeCertificates.Mount(file, builder.Resource, consumer, certificate.Location));
+            }
         }
     }
 

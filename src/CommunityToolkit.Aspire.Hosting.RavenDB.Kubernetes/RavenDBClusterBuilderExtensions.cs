@@ -63,42 +63,7 @@ public static class RavenDBClusterBuilderExtensions
             return builder;
         }
 
-        RavenDBClusterPublishing.Configure(builder, RavenDBClusterDeployment.ForCluster(builder.Resource, options));
-        return builder;
-    }
-
-    /// <summary>
-    /// Publishes the server as an existing RavenDB server, typically a cluster the RavenDB operator runs outside this
-    /// application: the Helm chart only gets the bootstrap Job that gives every application a client certificate for
-    /// its databases. No database is created. <c>aspire run</c> still starts the local container.
-    /// </summary>
-    /// <param name="builder">The resource builder for the RavenDB server.</param>
-    /// <param name="url">A parameter holding the server URL, for example <c>https://a.ravendb.example.com:443</c>.</param>
-    /// <param name="clientCertificateSecret">Existing Secret with an admin client certificate under the key <c>client.pfx</c>.</param>
-    /// <param name="certificateAuthoritySecret">
-    /// Existing Secret with the certificate authority of the server certificate under the key <c>ca.crt</c>, when it is
-    /// not publicly trusted.
-    /// </param>
-    /// <returns>The <see cref="IResourceBuilder{T}"/> for the RavenDB server resource.</returns>
-    [AspireExport]
-    public static IResourceBuilder<RavenDBServerResource> PublishAsExistingRavenDBCluster(
-        this IResourceBuilder<RavenDBServerResource> builder,
-        IResourceBuilder<ParameterResource> url,
-        string clientCertificateSecret,
-        string? certificateAuthoritySecret = null)
-    {
-        ArgumentNullException.ThrowIfNull(builder);
-        ArgumentNullException.ThrowIfNull(url);
-        ArgumentException.ThrowIfNullOrWhiteSpace(clientCertificateSecret);
-
-        if (!builder.ApplicationBuilder.ExecutionContext.IsPublishMode)
-        {
-            return builder;
-        }
-
-        RavenDBClusterPublishing.Configure(
-            builder,
-            RavenDBClusterDeployment.ForExisting(builder.Resource, url.Resource, clientCertificateSecret, certificateAuthoritySecret));
+        RavenDBClusterPublishing.Configure(builder, new RavenDBClusterDeployment(builder.Resource, options));
         return builder;
     }
 }

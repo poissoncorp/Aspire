@@ -18,8 +18,8 @@ internal interface IRavenDBServerAdministration : IDisposable
     /// <returns><see langword="false"/> when the database was created concurrently.</returns>
     Task<bool> CreateDatabaseAsync(string database, int replicationFactor, CancellationToken cancellationToken);
 
-    /// <returns>The databases the certificate may access, or <see langword="null"/> when the server does not know it.</returns>
-    Task<IReadOnlyDictionary<string, DatabaseAccess>?> GetCertificatePermissionsAsync(string thumbprint, CancellationToken cancellationToken);
+    /// <summary>The registered certificates whose name starts with <paramref name="namePrefix"/>.</summary>
+    Task<IReadOnlyList<RegisteredCertificate>> GetCertificatesAsync(string namePrefix, CancellationToken cancellationToken);
 
     /// <summary>Creates a client certificate with <see cref="SecurityClearance.ValidUser"/> clearance.</summary>
     /// <returns>The bundle the server returns (a zip with the .pfx).</returns>
@@ -29,6 +29,9 @@ internal interface IRavenDBServerAdministration : IDisposable
 
     Task DeleteCertificateAsync(string thumbprint, CancellationToken cancellationToken);
 }
+
+/// <summary>A certificate the server trusts. Database names in <paramref name="Permissions"/> compare case-insensitively.</summary>
+internal sealed record RegisteredCertificate(string Name, string Thumbprint, IReadOnlyDictionary<string, DatabaseAccess> Permissions);
 
 internal interface IRavenDBServerAdministrationFactory
 {
@@ -76,17 +79,28 @@ internal sealed class RavenDBServerAdministration : IRavenDBServerAdministration
         }
     }
 
-    public async Task<IReadOnlyDictionary<string, DatabaseAccess>?> GetCertificatePermissionsAsync(string thumbprint, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<RegisteredCertificate>> GetCertificatesAsync(string namePrefix, CancellationToken cancellationToken)
     {
-        var definition = await Server.SendAsync(new GetCertificateOperation(thumbprint), cancellationToken).ConfigureAwait(false);
+        const int PageSize = 1024;
+        var certificates = new List<RegisteredCertificate>();
 
-        if (definition is null)
+        for (var start = 0; ; start += PageSize)
         {
-            return null;
-        }
+            var page = await Server.SendAsync(new GetCertificatesOperation(start, PageSize), cancellationToken).ConfigureAwait(false);
 
-        // Database names are case-insensitive in RavenDB.
-        return new Dictionary<string, DatabaseAccess>(definition.Permissions ?? [], StringComparer.OrdinalIgnoreCase);
+            certificates.AddRange(page
+                .Where(c => c.Name?.StartsWith(namePrefix, StringComparison.OrdinalIgnoreCase) == true)
+                .Select(c => new RegisteredCertificate(
+                    c.Name,
+                    c.Thumbprint,
+                    // Database names are case-insensitive in RavenDB.
+                    new Dictionary<string, DatabaseAccess>(c.Permissions ?? [], StringComparer.OrdinalIgnoreCase))));
+
+            if (page.Length < PageSize)
+            {
+                return certificates;
+            }
+        }
     }
 
     public async Task<byte[]> CreateClientCertificateAsync(string name, IReadOnlyDictionary<string, DatabaseAccess> permissions, CancellationToken cancellationToken)

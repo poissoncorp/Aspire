@@ -7,6 +7,8 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.Tests;
 
 public sealed class RavenDBCloudProvisionerTests : IDisposable
 {
+    private const string NamePrefix = "aspire.test.production.";
+
     private readonly FakeRavenDBCloudApi _api = new();
     private readonly FakeRavenDBServer _server = new();
     private readonly InMemoryDeploymentStateManager _state = new();
@@ -84,29 +86,6 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     }
 
     [Fact]
-    public async Task ExistingProductThatIsMissingFailsInsteadOfCreatingOne()
-    {
-        var deployment = CreateDeployment(o => o.AsExisting("orders-production"));
-
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => Provision(deployment));
-
-        Assert.Contains("No RavenDB Cloud product named 'orders-production'", exception.Message);
-        Assert.Empty(_api.CreateRequests);
-    }
-
-    [Fact]
-    public async Task ExistingProductIsConnectedTo()
-    {
-        var product = _api.AddProduct("orders-production");
-        var deployment = CreateDeployment(o => o.AsExisting("orders-production"));
-
-        await Provision(deployment);
-
-        Assert.Equal(product.Id, deployment.ProductId);
-        Assert.Equal("https://a.orders-production.development.run", deployment.Endpoint.Url);
-    }
-
-    [Fact]
     public async Task CreatingWithoutAllowedIpsFailsWithAnExplanation()
     {
         var deployment = CreateDeployment();
@@ -172,22 +151,6 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     }
 
     [Fact]
-    public async Task DestroyNeverTouchesAnExistingProduct()
-    {
-        _api.AddProduct("orders-production");
-        var deployment = CreateDeployment(o =>
-        {
-            o.AsExisting("orders-production");
-            o.TerminateOnDestroy = true;
-        });
-        await Provision(deployment);
-
-        await Destroy(deployment);
-
-        Assert.Empty(_api.TerminatedProductIds);
-    }
-
-    [Fact]
     public void CertificateBundleYieldsThePfx()
     {
         var pfx = new byte[] { 1, 2, 3 };
@@ -231,19 +194,6 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     }
 
     [Fact]
-    public async Task ExistingProductGetsNoDatabases()
-    {
-        _api.AddProduct("orders-production");
-        var deployment = CreateDeployment(o => o.AsExisting("orders-production"), server => server.AddDatabase("orders", ensureCreated: true));
-        await Provision(deployment);
-
-        await Run(p => p.EnsureDatabasesAsync(deployment, TestContext.Current.CancellationToken));
-
-        Assert.Empty(_server.Databases);
-        Assert.Empty(_server.Connections);
-    }
-
-    [Fact]
     public async Task IssuesEachApplicationACertificateForItsDatabasesOnly()
     {
         var deployment = await ProvisionedDeployment();
@@ -256,8 +206,10 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
         Assert.Equal(["orders", "reports"], CertificateOnDisk("worker").Permissions.Keys.Order());
         Assert.All(_server.Certificates.Values.SelectMany(c => c.Permissions.Values), access => Assert.Equal(DatabaseAccess.ReadWrite, access));
 
-        Assert.Equal("*", File.ReadAllText(Path.Combine(_output.FullName, "ravendb-certs", ".gitignore")).Trim());
-        Assert.Equal(ThumbprintOnDisk("api"), _state[deployment.StateSectionName]!["clientCertificates"]!["api"]!["thumbprint"]!.GetValue<string>());
+        Assert.Equal("*", File.ReadAllText(Path.Combine(CertificateDirectory, ".gitignore")).Trim());
+
+        // The product decides what exists, not the deployment state.
+        Assert.Equal(["createdByDeployment", "productId"], _state[deployment.StateSectionName]!.Select(p => p.Key).Order());
 
         // One download of the admin certificate serves every application.
         Assert.Single(_api.CertificateDownloads);
@@ -291,17 +243,20 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     }
 
     [Fact]
-    public async Task MissingFileGetsANewCertificateAndTheOldOneIsRevoked()
+    public async Task DeploymentFromAnotherMachineLeavesOneCertificatePerApplication()
     {
         await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"));
         var issued = ThumbprintOnDisk("api");
+
+        // A CI runner: neither the certificate file nor the deployment state.
         File.Delete(CertificatePath("api"));
+        await _state.ClearAllStateAsync(TestContext.Current.CancellationToken);
 
         await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"));
 
         Assert.NotEqual(issued, ThumbprintOnDisk("api"));
         Assert.Equal(issued, Assert.Single(_server.DeletedThumbprints));
-        Assert.Single(_server.Certificates);
+        Assert.Equal(ThumbprintOnDisk("api"), Assert.Single(_server.Certificates).Key);
     }
 
     [Fact]
@@ -324,12 +279,23 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
         await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"), Request("worker", "orders"));
         var worker = ThumbprintOnDisk("worker");
 
-        var deployment = await ProvisionedDeployment();
-        await IssueCertificates(deployment, Request("api", "orders"));
+        await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"));
 
         Assert.Equal(worker, Assert.Single(_server.DeletedThumbprints));
         Assert.False(File.Exists(CertificatePath("worker")));
-        Assert.Null(_state[deployment.StateSectionName]!["clientCertificates"]!["worker"]);
+        Assert.True(File.Exists(CertificatePath("api")));
+    }
+
+    [Fact]
+    public async Task CertificatesOfOtherDeploymentsAreLeftAlone()
+    {
+        _server.Certificates["0123456789ABCDEF0123456789ABCDEF01234567"] = new FakeCertificate("aspire.other.production.api", []);
+        _server.Certificates["89ABCDEF0123456789ABCDEF0123456789ABCDEF"] = new FakeCertificate("orders-team", []);
+
+        await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"));
+
+        Assert.Empty(_server.DeletedThumbprints);
+        Assert.Equal(3, _server.Certificates.Count);
     }
 
     [Fact]
@@ -350,13 +316,25 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
         var issued = _server.Certificates.Keys.ToList();
 
         // A new process: the product is known from the deployment state only.
-        var deployment = CreateDeployment(o => o.WithAllowedIps("203.0.113.0/24"));
-        await Destroy(deployment);
+        await Destroy(CreateDeployment(o => o.WithAllowedIps("203.0.113.0/24")), Request("api", "orders"), Request("worker", "orders"));
 
         Assert.Equal(issued.Order(), _server.DeletedThumbprints.Order());
         Assert.False(File.Exists(CertificatePath("api")));
-        Assert.Null(_state[deployment.StateSectionName]!["clientCertificates"]);
         Assert.Single(_api.Products);
+    }
+
+    [Fact]
+    public async Task DestroyWithoutDeploymentStateStillRevokesTheCertificates()
+    {
+        await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"));
+        var issued = ThumbprintOnDisk("api");
+        await _state.ClearAllStateAsync(TestContext.Current.CancellationToken);
+
+        await Destroy(CreateDeployment(o => o.TerminateOnDestroy = true), Request("api", "orders"));
+
+        // Found by name, so not known to be ours: revoked from, never terminated.
+        Assert.Equal(issued, Assert.Single(_server.DeletedThumbprints));
+        Assert.Empty(_api.TerminatedProductIds);
     }
 
     [Fact]
@@ -364,32 +342,20 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     {
         await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"));
 
-        await Destroy(CreateDeployment(o =>
-        {
-            o.WithAllowedIps("203.0.113.0/24");
-            o.TerminateOnDestroy = true;
-        }));
+        await Destroy(
+            CreateDeployment(o =>
+            {
+                o.WithAllowedIps("203.0.113.0/24");
+                o.TerminateOnDestroy = true;
+            }),
+            Request("api", "orders"));
 
         Assert.Empty(_server.DeletedThumbprints);
         Assert.Single(_api.TerminatedProductIds);
         Assert.False(File.Exists(CertificatePath("api")));
     }
 
-    [Fact]
-    public async Task DestroyOfAnExistingProductRevokesItsCertificatesOnly()
-    {
-        _api.AddProduct("orders-production");
-        var deployment = CreateDeployment(o => o.AsExisting("orders-production"));
-        await Provision(deployment);
-        await IssueCertificates(deployment, Request("api", "orders"));
-        var issued = ThumbprintOnDisk("api");
-
-        await Destroy(CreateDeployment(o => o.AsExisting("orders-production")));
-
-        Assert.Equal(issued, Assert.Single(_server.DeletedThumbprints));
-        Assert.Empty(_api.TerminatedProductIds);
-        Assert.Null(_state[deployment.StateSectionName]);
-    }
+    private string CertificateDirectory => Path.Combine(_output.FullName, "ravendb-certs");
 
     private async Task<RavenDBCloudDeployment> ProvisionedDeployment()
     {
@@ -399,16 +365,18 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     }
 
     private ClientCertificateRequest Request(string consumer, params string[] databases) =>
-        new(consumer, $"aspire.test.production.{consumer}", databases, CertificatePath(consumer));
+        new(consumer, NamePrefix + consumer, databases, CertificatePath(consumer));
 
-    private string CertificatePath(string consumer) => Path.Combine(_output.FullName, "ravendb-certs", $"ravendb-{consumer}.pfx");
+    private ClientCertificatePlan Plan(ClientCertificateRequest[] requests) => new(NamePrefix, [CertificateDirectory], requests);
+
+    private string CertificatePath(string consumer) => Path.Combine(CertificateDirectory, $"ravendb-{consumer}.pfx");
 
     private string ThumbprintOnDisk(string consumer) => RavenDBCloudProvisioner.GetThumbprint(File.ReadAllBytes(CertificatePath(consumer)));
 
     private FakeCertificate CertificateOnDisk(string consumer) => _server.Certificates[ThumbprintOnDisk(consumer)];
 
     private Task IssueCertificates(RavenDBCloudDeployment deployment, params ClientCertificateRequest[] requests) =>
-        Run(p => p.EnsureClientCertificatesAsync(deployment, requests, TestContext.Current.CancellationToken));
+        Run(p => p.EnsureClientCertificatesAsync(deployment, Plan(requests), TestContext.Current.CancellationToken));
 
     private RavenDBCloudDeployment CreateDeployment(
         Action<RavenDBCloudOptions>? configure = null,
@@ -431,8 +399,8 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     private Task Provision(RavenDBCloudDeployment deployment) =>
         Run(p => p.ProvisionAsync(deployment, TestContext.Current.CancellationToken));
 
-    private Task Destroy(RavenDBCloudDeployment deployment) =>
-        Run(p => p.DestroyAsync(deployment, TestContext.Current.CancellationToken));
+    private Task Destroy(RavenDBCloudDeployment deployment, params ClientCertificateRequest[] requests) =>
+        Run(p => p.DestroyAsync(deployment, Plan(requests), TestContext.Current.CancellationToken));
 
     private async Task Run(Func<RavenDBCloudProvisioner, Task> action)
     {

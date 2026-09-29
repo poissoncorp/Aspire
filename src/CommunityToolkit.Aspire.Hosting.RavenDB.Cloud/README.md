@@ -55,21 +55,17 @@ In Docker Compose the certificate is written to `ravendb-certs/` next to `docker
 builder.AddRavenDBClient("mydb");
 ```
 
-Redeploying keeps a certificate while its file is in place and updates its access when the references change. The certificate of an application that is no longer deployed is revoked, and `aspire destroy` revokes them all.
+The certificates are named `aspire.<AppHost>.<environment>.<application>`, and every deployment leaves each application with exactly one. It keeps the certificate in the application's file while the product still knows it, and updates its access when the references change. It revokes every other certificate with the application's name, so a deployment from a machine without that file, such as a CI runner, replaces the certificate instead of adding one. It also revokes the certificates of applications that are no longer deployed. Two AppHosts with the same name and environment on one product would revoke each other's certificates.
 
-### An existing product
+An application that brings a certificate of its own (`WithRavenDBClientCertificateFile`) gets none issued.
 
-For a product managed elsewhere, typically production, the deployment only connects to it. It fails when the account has no product with that name, and it never creates, changes or terminates the product or its databases. It does issue the applications' client certificates, which `aspire destroy` revokes:
+### A product someone else owns
 
-```csharp
-var db = builder.AddRavenDB("ravendb")
-    .PublishAsExistingRavenDBCloud(apiKey, "orders-production")
-    .AddDatabase("mydb");
-```
+A product in your account with the configured name is used as it is, and `aspire destroy` never terminates it. For a product owned by someone else, do not share the account's API key, which has owner rights: publish the server with `PublishAsExisting(url)` from the [RavenDB hosting integration](https://www.nuget.org/packages/CommunityToolkit.Aspire.Hosting.RavenDB), and give each application the certificate the owner issued for it with `WithRavenDBClientCertificateFile`.
 
 ### Destroy
 
-`aspire destroy` stops the application first, revokes the client certificates and then terminates the product, but only if this deployment created it and `TerminateOnDestroy` is set. Terminating a product deletes its data.
+`aspire destroy` stops the application first, revokes the client certificates and then terminates the product, but only if this deployment created it and `TerminateOnDestroy` is set. Terminating a product deletes its data. Without deployment state it still finds the product by name and revokes the certificates, but leaves the product running.
 
 `aspire destroy` also clears the deployment state. A product it leaves running is therefore found by name on the next deployment and treated as one this deployment did not create: terminate it in the portal once it is no longer needed.
 

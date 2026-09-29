@@ -209,6 +209,51 @@ public class RavenDBPublishTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task ComposePublishMountsTheCertificateTheServerOwnerIssued()
+    {
+        using var tempDir = new TempDirectory();
+        using var builder = CreateForPublish(tempDir.Path);
+
+        builder.Configuration["Parameters:ravendb-url"] = "https://a.ravendb.example.com";
+        builder.AddDockerComposeEnvironment("compose");
+        var ravendb = builder.AddRavenDB("ravendb").PublishAsExisting(builder.AddParameter("ravendb-url"));
+        var orders = ravendb.AddDatabase("orders");
+
+        builder.AddContainer("consumer", "busybox")
+            .WithReference(orders)
+            .WithRavenDBClientCertificateFile(orders, "certs/consumer.pfx");
+
+        using var app = builder.Build();
+        await app.RunAsync(TestContext.Current.CancellationToken);
+
+        var yaml = new YamlStream();
+        yaml.Load(new StringReader(File.ReadAllText(Path.Combine(tempDir.Path, "docker-compose.yaml"))));
+        var compose = (YamlMappingNode)yaml.Documents[0].RootNode;
+
+        // Relative to the AppHost, which is not where Docker Compose resolves it.
+        var file = compose["secrets"]["ravendb-ravendb-consumer-certificate"]["file"].ToString();
+        Assert.Equal(Path.GetFullPath("certs/consumer.pfx", builder.AppHostDirectory), file);
+
+        var consumer = (YamlMappingNode)compose["services"]["consumer"];
+        Assert.Equal("ravendb-ravendb-consumer-certificate", consumer["secrets"][0]["source"].ToString());
+        Assert.Equal("/run/secrets/ravendb-ravendb.pfx", consumer["environment"]["Aspire__RavenDB__Client__orders__CertificatePath"].ToString());
+    }
+
+    [Fact]
+    public async Task PublishFailsForACertificateOfAServerTheApplicationDoesNotReference()
+    {
+        using var tempDir = new TempDirectory();
+        using var builder = CreateForPublish(tempDir.Path);
+
+        builder.AddDockerComposeEnvironment("compose");
+        var orders = builder.AddRavenDB("ravendb").AddDatabase("orders");
+        builder.AddContainer("consumer", "busybox").WithRavenDBClientCertificateFile(orders, "consumer.pfx");
+
+        using var app = builder.Build();
+        await Assert.ThrowsAsync<DistributedApplicationException>(() => app.RunAsync(TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
     public async Task KubernetesPublishAsExistingDeploysNoServer()
     {
         using var tempDir = new TempDirectory();

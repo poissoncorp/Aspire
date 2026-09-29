@@ -13,6 +13,11 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud;
 /// the applications' client certificates, and revoke or terminate on destroy. Independent of the pipeline plumbing so
 /// it can be tested directly.
 /// </summary>
+/// <remarks>
+/// The deployment state only records which product this deployment created. Everything else is read back from the
+/// product, so a deployment from a machine without that state (a CI runner) finds the same product and ends with the
+/// same certificates.
+/// </remarks>
 internal sealed class RavenDBCloudProvisioner(
     RavenDBCloudApiClient client,
     IDeploymentStateManager state,
@@ -20,35 +25,19 @@ internal sealed class RavenDBCloudProvisioner(
     ILogger logger)
 {
     private const string ProductIdKey = "productId";
-    private const string UrlKey = "url";
     private const string CreatedByDeploymentKey = "createdByDeployment";
-    private const string ClientCertificatesKey = "clientCertificates";
-    private const string ThumbprintKey = "thumbprint";
-    private const string FileKey = "file";
 
     public async Task ProvisionAsync(RavenDBCloudDeployment deployment, CancellationToken cancellationToken)
     {
         var section = await state.AcquireSectionAsync(deployment.StateSectionName, cancellationToken).ConfigureAwait(false);
-        var createdByDeployment = ReadBool(section, CreatedByDeploymentKey);
+        var recordedId = ReadString(section, ProductIdKey);
+        var (productId, details) = await FindProductAsync(deployment, recordedId, cancellationToken).ConfigureAwait(false);
 
-        var (productId, details) = await FindProductAsync(deployment, ReadString(section, ProductIdKey), cancellationToken).ConfigureAwait(false);
-
-        if (productId is not null && !string.Equals(productId, ReadString(section, ProductIdKey), StringComparison.Ordinal))
-        {
-            // Found by name, not recorded by this deployment: someone else's until proven otherwise.
-            createdByDeployment = false;
-        }
+        // Found by name, not recorded by this deployment: someone else's until proven otherwise.
+        var createdByDeployment = productId is not null && productId == recordedId && ReadBool(section, CreatedByDeploymentKey);
 
         if (productId is null)
         {
-            if (deployment.Options.IsExisting)
-            {
-                throw new InvalidOperationException(
-                    $"No RavenDB Cloud product named '{deployment.ProductName}' exists in the account. AsExisting(...) " +
-                    "never creates a product: create it in the portal, fix the name, or drop AsExisting to let the " +
-                    "deployment create it.");
-            }
-
             var request = await BuildCreateRequestAsync(deployment, cancellationToken).ConfigureAwait(false);
 
             logger.LogInformation(
@@ -64,12 +53,9 @@ internal sealed class RavenDBCloudProvisioner(
             productId = await client.CreateProductAsync(request, cancellationToken).ConfigureAwait(false);
             createdByDeployment = true;
 
-            // Recorded right away: a deployment interrupted while the product is being created must find it again.
-            section.Data[ProductIdKey] = JsonValue.Create(productId);
-            section.Data[CreatedByDeploymentKey] = JsonValue.Create(true);
-            await state.SaveSectionAsync(section, cancellationToken).ConfigureAwait(false);
-            section = await state.AcquireSectionAsync(deployment.StateSectionName, cancellationToken).ConfigureAwait(false);
-
+            // Recorded right away: a deployment interrupted while the product is being created must find it again,
+            // and destroy must know that it may terminate it.
+            section = await RecordAsync(deployment, section, productId, createdByDeployment, cancellationToken).ConfigureAwait(false);
             details = null;
         }
         else
@@ -78,23 +64,9 @@ internal sealed class RavenDBCloudProvisioner(
         }
 
         details = await WaitForActiveAsync(deployment, productId, details, cancellationToken).ConfigureAwait(false);
+        Resolve(deployment, productId, details);
 
-        var url = details.Dns?.FirstOrDefault(d => !string.IsNullOrWhiteSpace(d))
-            ?? throw new InvalidOperationException($"RavenDB Cloud product '{deployment.ProductName}' is active but reports no URL.");
-
-        if (!url.Contains("://", StringComparison.Ordinal))
-        {
-            url = "https://" + url;
-        }
-
-        deployment.ProductId = productId;
-        deployment.NodeCount = Math.Max(details.NodeTags?.Count ?? 1, 1);
-        deployment.Endpoint.Url = url.TrimEnd('/');
-
-        section.Data[ProductIdKey] = JsonValue.Create(productId);
-        section.Data[UrlKey] = JsonValue.Create(deployment.Endpoint.Url);
-        section.Data[CreatedByDeploymentKey] = JsonValue.Create(createdByDeployment);
-        await state.SaveSectionAsync(section, cancellationToken).ConfigureAwait(false);
+        await RecordAsync(deployment, section, productId, createdByDeployment, cancellationToken).ConfigureAwait(false);
 
         logger.LogInformation("RavenDB Cloud product '{Product}' is active at {Url}.", deployment.ProductName, deployment.Endpoint.Url);
     }
@@ -103,8 +75,7 @@ internal sealed class RavenDBCloudProvisioner(
     {
         var databases = deployment.Server.DatabasesToCreate;
 
-        // An existing product belongs to someone else: the deployment creates nothing in it.
-        if (databases.Count == 0 || deployment.Options.IsExisting)
+        if (databases.Count == 0)
         {
             return;
         }
@@ -125,260 +96,183 @@ internal sealed class RavenDBCloudProvisioner(
     }
 
     /// <summary>
-    /// Gives every application its own client certificate with access to its databases only, and writes it where
-    /// the deployment artifacts expect it. A certificate issued by an earlier deployment is kept while its file is
-    /// still in place, so redeploying does not hand the applications new credentials. Certificates of applications
-    /// that are no longer deployed are revoked.
+    /// Leaves every application with exactly one client certificate, with access to its databases only, in the file
+    /// the deployment artifacts mount. The certificate in that file is kept while the product still knows it; any
+    /// other certificate with the application's name is revoked, and so are those of applications that are no longer
+    /// deployed.
     /// </summary>
-    public async Task EnsureClientCertificatesAsync(
-        RavenDBCloudDeployment deployment,
-        IReadOnlyList<ClientCertificateRequest> requests,
-        CancellationToken cancellationToken)
+    public async Task EnsureClientCertificatesAsync(RavenDBCloudDeployment deployment, ClientCertificatePlan plan, CancellationToken cancellationToken)
     {
-        var section = await state.AcquireSectionAsync(deployment.StateSectionName, cancellationToken).ConfigureAwait(false);
-        var recorded = ReadClientCertificates(section);
-        var stale = recorded.Keys.Where(c => requests.All(r => !string.Equals(r.Consumer, c, StringComparison.Ordinal))).ToList();
-
-        if (requests.Count == 0 && stale.Count == 0)
+        if (!IsSecured(deployment))
         {
+            if (plan.Requests.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    $"RavenDB Cloud product '{deployment.ProductName}' is not served over HTTPS ({deployment.Endpoint.Url}); " +
+                    "client certificates need a secured server.");
+            }
+
             return;
         }
 
-        if (requests.Count > 0 && deployment.Endpoint.Url?.StartsWith("https://", StringComparison.OrdinalIgnoreCase) != true)
-        {
-            throw new InvalidOperationException(
-                $"RavenDB Cloud product '{deployment.ProductName}' is not served over HTTPS ({deployment.Endpoint.Url}); " +
-                "client certificates need a secured server.");
-        }
-
         using var server = await ConnectAsync(deployment, cancellationToken).ConfigureAwait(false);
+        var registered = await server.GetCertificatesAsync(plan.NamePrefix, cancellationToken).ConfigureAwait(false);
 
-        foreach (var request in requests)
+        foreach (var request in plan.Requests)
         {
-            var permissions = request.Databases.ToDictionary(d => d, _ => DatabaseAccess.ReadWrite, StringComparer.OrdinalIgnoreCase);
-            recorded.TryGetValue(request.Consumer, out var previous);
+            var current = await EnsureClientCertificateAsync(server, request, registered, cancellationToken).ConfigureAwait(false);
 
-            if (previous is not null && await TryReuseAsync(server, previous, request, permissions, cancellationToken).ConfigureAwait(false))
+            foreach (var other in registered.Where(c => IsNamed(c, request.CertificateName) && !IsSame(c.Thumbprint, current)))
             {
-                continue;
-            }
-
-            var bundle = await server.CreateClientCertificateAsync(request.CertificateName, permissions, cancellationToken).ConfigureAwait(false);
-            var pfx = ExtractPfx(bundle)
-                ?? throw new InvalidOperationException($"The certificate RavenDB issued for '{request.Consumer}' contains no .pfx file.");
-            var thumbprint = GetThumbprint(pfx);
-
-            WriteCertificateFile(request.FilePath, pfx);
-
-            // Recorded right away: a deployment interrupted later must still be able to revoke it.
-            GetClientCertificatesNode(section)[request.Consumer] = new JsonObject
-            {
-                [ThumbprintKey] = thumbprint,
-                [FileKey] = request.FilePath,
-            };
-            section = await SaveAsync(section, deployment, cancellationToken).ConfigureAwait(false);
-
-            logger.LogInformation(
-                "Issued client certificate '{Name}' ({Thumbprint}) for '{Consumer}' with access to {Databases}.",
-                request.CertificateName,
-                thumbprint,
-                request.Consumer,
-                request.Databases.Count == 0 ? "no database" : string.Join(", ", request.Databases));
-
-            if (previous is not null)
-            {
-                await RevokeAsync(server, request.Consumer, previous, cancellationToken).ConfigureAwait(false);
-
-                if (!string.Equals(previous.File, request.FilePath, StringComparison.Ordinal))
-                {
-                    DeleteFile(previous.File);
-                }
+                await RevokeAsync(server, other, cancellationToken).ConfigureAwait(false);
             }
         }
 
-        foreach (var consumer in stale)
+        foreach (var stale in registered.Where(c => plan.Requests.All(r => !IsNamed(c, r.CertificateName))))
         {
-            await RevokeAsync(server, consumer, recorded[consumer], cancellationToken).ConfigureAwait(false);
-            DeleteFile(recorded[consumer].File);
-            GetClientCertificatesNode(section).Remove(consumer);
-        }
-
-        if (stale.Count > 0)
-        {
-            await SaveAsync(section, deployment, cancellationToken).ConfigureAwait(false);
+            await RevokeAsync(server, stale, cancellationToken).ConfigureAwait(false);
+            DeleteFiles(deployment, plan, stale.Name[plan.NamePrefix.Length..]);
         }
     }
 
-    public async Task DestroyAsync(RavenDBCloudDeployment deployment, CancellationToken cancellationToken)
+    public async Task DestroyAsync(RavenDBCloudDeployment deployment, ClientCertificatePlan certificates, CancellationToken cancellationToken)
     {
         var section = await state.AcquireSectionAsync(deployment.StateSectionName, cancellationToken).ConfigureAwait(false);
-        var productId = ReadString(section, ProductIdKey);
-        var createdByDeployment = ReadBool(section, CreatedByDeploymentKey);
-        var terminates = !deployment.Options.IsExisting &&
-                         productId is not null &&
-                         createdByDeployment &&
-                         deployment.Options.TerminateOnDestroy;
+        var recordedId = ReadString(section, ProductIdKey);
+        var (productId, details) = await FindProductAsync(deployment, recordedId, cancellationToken).ConfigureAwait(false);
 
-        // The certificates of a product that keeps running are revoked; a terminated product takes them with it.
-        section = await RemoveClientCertificatesAsync(deployment, section, revoke: !terminates, cancellationToken).ConfigureAwait(false);
-
-        if (deployment.Options.IsExisting)
+        foreach (var request in certificates.Requests)
         {
-            logger.LogInformation("RavenDB Cloud product '{Product}' is an existing product and is left running.", deployment.ProductName);
+            DeleteFiles(deployment, certificates, request.Consumer);
+        }
+
+        if (productId is null || details is null)
+        {
+            logger.LogInformation("RavenDB Cloud product '{Product}' does not exist; nothing to destroy.", deployment.ProductName);
             await state.DeleteSectionAsync(section, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (productId is null)
+        Resolve(deployment, productId, details);
+        var createdByDeployment = productId == recordedId && ReadBool(section, CreatedByDeploymentKey);
+
+        if (createdByDeployment && deployment.Options.TerminateOnDestroy)
         {
-            logger.LogInformation("No RavenDB Cloud product is recorded for '{Resource}'; nothing to terminate.", deployment.Server.Name);
+            // The certificates go with the product.
+            logger.LogInformation("Terminating RavenDB Cloud product '{Product}' ({ProductId}).", deployment.ProductName, productId);
+
+            await client.TerminateProductAsync(productId, cancellationToken).ConfigureAwait(false);
+            await state.DeleteSectionAsync(section, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (!createdByDeployment)
-        {
-            logger.LogWarning(
-                "RavenDB Cloud product '{Product}' ({ProductId}) was not created by this deployment and is left running.",
-                deployment.ProductName,
-                productId);
-            return;
-        }
+        await RevokeClientCertificatesAsync(deployment, certificates, cancellationToken).ConfigureAwait(false);
 
-        if (!terminates)
+        if (createdByDeployment)
         {
-            // Aspire clears the deployment state after destroy, so a later deployment finds this product by name
-            // and treats it as someone else's: from here on only the portal terminates it.
+            // Aspire clears the deployment state after destroy, so a later deployment finds this product by name and
+            // treats it as someone else's: from here on only the portal terminates it.
             logger.LogWarning(
                 "RavenDB Cloud product '{Product}' ({ProductId}) is left running because TerminateOnDestroy is not set; " +
                 "terminating deletes its data. Terminate it in the portal once it is no longer needed.",
                 deployment.ProductName,
                 productId);
+        }
+        else
+        {
+            logger.LogWarning(
+                "RavenDB Cloud product '{Product}' ({ProductId}) was not created by this deployment and is left running.",
+                deployment.ProductName,
+                productId);
+        }
+    }
+
+    /// <returns>The thumbprint of the application's certificate.</returns>
+    private async Task<string> EnsureClientCertificateAsync(
+        IRavenDBServerAdministration server,
+        ClientCertificateRequest request,
+        IReadOnlyList<RegisteredCertificate> registered,
+        CancellationToken cancellationToken)
+    {
+        var permissions = request.Databases.ToDictionary(d => d, _ => DatabaseAccess.ReadWrite, StringComparer.OrdinalIgnoreCase);
+        var onDisk = File.Exists(request.FilePath)
+            ? TryGetThumbprint(await File.ReadAllBytesAsync(request.FilePath, cancellationToken).ConfigureAwait(false))
+            : null;
+
+        if (registered.FirstOrDefault(c => IsNamed(c, request.CertificateName) && IsSame(c.Thumbprint, onDisk)) is { } current)
+        {
+            if (GrantsExactly(current, permissions))
+            {
+                logger.LogInformation("Client certificate of '{Consumer}' ({Thumbprint}) is up to date.", request.Consumer, current.Thumbprint);
+            }
+            else
+            {
+                await server.SetCertificatePermissionsAsync(current.Thumbprint, request.CertificateName, permissions, cancellationToken).ConfigureAwait(false);
+                logger.LogInformation("Client certificate of '{Consumer}' now grants access to {Databases}.", request.Consumer, Describe(request.Databases));
+            }
+
+            return current.Thumbprint;
+        }
+
+        var bundle = await server.CreateClientCertificateAsync(request.CertificateName, permissions, cancellationToken).ConfigureAwait(false);
+        var pfx = ExtractPfx(bundle)
+            ?? throw new InvalidOperationException($"The certificate RavenDB issued for '{request.Consumer}' contains no .pfx file.");
+        var thumbprint = GetThumbprint(pfx);
+
+        WriteCertificateFile(request.FilePath, pfx);
+
+        logger.LogInformation(
+            "Issued client certificate '{Name}' ({Thumbprint}) for '{Consumer}' with access to {Databases}.",
+            request.CertificateName,
+            thumbprint,
+            request.Consumer,
+            Describe(request.Databases));
+
+        return thumbprint;
+    }
+
+    /// <summary>Revokes every certificate the deployment issued on a product that keeps running.</summary>
+    private async Task RevokeClientCertificatesAsync(RavenDBCloudDeployment deployment, ClientCertificatePlan certificates, CancellationToken cancellationToken)
+    {
+        if (!IsSecured(deployment))
+        {
             return;
         }
 
-        logger.LogInformation("Terminating RavenDB Cloud product '{Product}' ({ProductId}).", deployment.ProductName, productId);
-
-        await client.TerminateProductAsync(productId, cancellationToken).ConfigureAwait(false);
-        await state.DeleteSectionAsync(section, cancellationToken).ConfigureAwait(false);
-    }
-
-    private async Task<DeploymentStateSection> RemoveClientCertificatesAsync(
-        RavenDBCloudDeployment deployment,
-        DeploymentStateSection section,
-        bool revoke,
-        CancellationToken cancellationToken)
-    {
-        var recorded = ReadClientCertificates(section);
-
-        if (recorded.Count == 0)
-        {
-            return section;
-        }
-
-        deployment.ProductId ??= ReadString(section, ProductIdKey);
-        deployment.Endpoint.Url ??= ReadString(section, UrlKey);
-
-        if (revoke)
-        {
-            try
-            {
-                using var server = await ConnectAsync(deployment, cancellationToken).ConfigureAwait(false);
-
-                foreach (var (consumer, certificate) in recorded)
-                {
-                    await RevokeAsync(server, consumer, certificate, cancellationToken).ConfigureAwait(false);
-                }
-            }
-            catch (Exception exception) when (exception is not OperationCanceledException)
-            {
-                logger.LogWarning(
-                    exception,
-                    "Could not connect to RavenDB Cloud product '{Product}' to revoke the client certificates of {Consumers}. " +
-                    "Remove them in the RavenDB Studio.",
-                    deployment.ProductName,
-                    string.Join(", ", recorded.Keys));
-            }
-        }
-
-        foreach (var certificate in recorded.Values)
-        {
-            DeleteFile(certificate.File);
-        }
-
-        section.Data.Remove(ClientCertificatesKey);
-
-        return await SaveAsync(section, deployment, cancellationToken).ConfigureAwait(false);
-    }
-
-    private async Task<bool> TryReuseAsync(
-        IRavenDBServerAdministration server,
-        RecordedCertificate previous,
-        ClientCertificateRequest request,
-        IReadOnlyDictionary<string, DatabaseAccess> permissions,
-        CancellationToken cancellationToken)
-    {
-        if (!File.Exists(request.FilePath))
-        {
-            return false;
-        }
-
-        var onDisk = TryGetThumbprint(await File.ReadAllBytesAsync(request.FilePath, cancellationToken).ConfigureAwait(false));
-
-        if (!string.Equals(onDisk, previous.Thumbprint, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        var current = await server.GetCertificatePermissionsAsync(previous.Thumbprint, cancellationToken).ConfigureAwait(false);
-
-        if (current is null)
-        {
-            logger.LogWarning(
-                "The client certificate of '{Consumer}' ({Thumbprint}) is no longer known to the server.",
-                request.Consumer,
-                previous.Thumbprint);
-            return false;
-        }
-
-        var unchanged = current.Count == permissions.Count &&
-                        permissions.All(p => current.TryGetValue(p.Key, out var access) && access == p.Value);
-
-        if (unchanged)
-        {
-            logger.LogInformation("Client certificate of '{Consumer}' ({Thumbprint}) is up to date.", request.Consumer, previous.Thumbprint);
-            return true;
-        }
-
-        await server.SetCertificatePermissionsAsync(previous.Thumbprint, request.CertificateName, permissions, cancellationToken).ConfigureAwait(false);
-
-        logger.LogInformation(
-            "Client certificate of '{Consumer}' now grants access to {Databases}.",
-            request.Consumer,
-            permissions.Count == 0 ? "no database" : string.Join(", ", permissions.Keys));
-
-        return true;
-    }
-
-    private async Task RevokeAsync(IRavenDBServerAdministration server, string consumer, RecordedCertificate certificate, CancellationToken cancellationToken)
-    {
         try
         {
-            if (await server.GetCertificatePermissionsAsync(certificate.Thumbprint, cancellationToken).ConfigureAwait(false) is null)
-            {
-                // Already removed, for example in the RavenDB Studio.
-                return;
-            }
+            using var server = await ConnectAsync(deployment, cancellationToken).ConfigureAwait(false);
 
-            await server.DeleteCertificateAsync(certificate.Thumbprint, cancellationToken).ConfigureAwait(false);
-            logger.LogInformation("Revoked client certificate {Thumbprint} of '{Consumer}'.", certificate.Thumbprint, consumer);
+            foreach (var certificate in await server.GetCertificatesAsync(certificates.NamePrefix, cancellationToken).ConfigureAwait(false))
+            {
+                await RevokeAsync(server, certificate, cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             logger.LogWarning(
                 exception,
-                "Could not revoke client certificate {Thumbprint} of '{Consumer}'. Remove it in the RavenDB Studio.",
-                certificate.Thumbprint,
-                consumer);
+                "Could not connect to RavenDB Cloud product '{Product}' to revoke the client certificates named '{Prefix}*'. " +
+                "Remove them in the RavenDB Studio.",
+                deployment.ProductName,
+                certificates.NamePrefix);
+        }
+    }
+
+    private async Task RevokeAsync(IRavenDBServerAdministration server, RegisteredCertificate certificate, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await server.DeleteCertificateAsync(certificate.Thumbprint, cancellationToken).ConfigureAwait(false);
+            logger.LogInformation("Revoked client certificate '{Name}' ({Thumbprint}).", certificate.Name, certificate.Thumbprint);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            logger.LogWarning(
+                exception,
+                "Could not revoke client certificate '{Name}' ({Thumbprint}). Remove it in the RavenDB Studio.",
+                certificate.Name,
+                certificate.Thumbprint);
         }
     }
 
@@ -387,7 +281,7 @@ internal sealed class RavenDBCloudProvisioner(
         var url = deployment.Endpoint.Url
             ?? throw new InvalidOperationException($"RavenDB Cloud product '{deployment.ProductName}' has not been resolved yet.");
 
-        var certificate = url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+        var certificate = IsSecured(deployment)
             ? await GetAdminCertificateAsync(deployment, cancellationToken).ConfigureAwait(false)
             : null;
 
@@ -565,6 +459,31 @@ internal sealed class RavenDBCloudProvisioner(
         return LoadCertificate(deployment.AdminCertificate);
     }
 
+    /// <summary>Takes the product's id, size and URL from its details; the API lists host names without a scheme.</summary>
+    private static void Resolve(RavenDBCloudDeployment deployment, string productId, ProductDetails details)
+    {
+        var url = details.Dns?.FirstOrDefault(d => !string.IsNullOrWhiteSpace(d))
+            ?? throw new InvalidOperationException($"RavenDB Cloud product '{deployment.ProductName}' is active but reports no URL.");
+
+        deployment.ProductId = productId;
+        deployment.NodeCount = Math.Max(details.NodeTags?.Count ?? 1, 1);
+        deployment.Endpoint.Url = (url.Contains("://", StringComparison.Ordinal) ? url : "https://" + url).TrimEnd('/');
+    }
+
+    private async Task<DeploymentStateSection> RecordAsync(
+        RavenDBCloudDeployment deployment,
+        DeploymentStateSection section,
+        string productId,
+        bool createdByDeployment,
+        CancellationToken cancellationToken)
+    {
+        section.Data[ProductIdKey] = JsonValue.Create(productId);
+        section.Data[CreatedByDeploymentKey] = JsonValue.Create(createdByDeployment);
+
+        await state.SaveSectionAsync(section, cancellationToken).ConfigureAwait(false);
+        return await state.AcquireSectionAsync(deployment.StateSectionName, cancellationToken).ConfigureAwait(false);
+    }
+
     internal static X509Certificate2 LoadCertificate(byte[] pfx) =>
 #if NET9_0_OR_GREATER
         X509CertificateLoader.LoadPkcs12(pfx, password: null);
@@ -607,52 +526,18 @@ internal sealed class RavenDBCloudProvisioner(
         File.WriteAllBytes(path, pfx);
     }
 
-    private static void DeleteFile(string path)
+    private static void DeleteFiles(RavenDBCloudDeployment deployment, ClientCertificatePlan plan, string consumer)
     {
-        if (File.Exists(path))
+        foreach (var directory in plan.Directories)
         {
-            File.Delete(path);
-        }
-    }
+            var path = Path.Combine(directory, RavenDBCloudClientCertificates.FileName(deployment.Server, consumer));
 
-    private async Task<DeploymentStateSection> SaveAsync(DeploymentStateSection section, RavenDBCloudDeployment deployment, CancellationToken cancellationToken)
-    {
-        await state.SaveSectionAsync(section, cancellationToken).ConfigureAwait(false);
-        return await state.AcquireSectionAsync(deployment.StateSectionName, cancellationToken).ConfigureAwait(false);
-    }
-
-    private static Dictionary<string, RecordedCertificate> ReadClientCertificates(DeploymentStateSection section)
-    {
-        var certificates = new Dictionary<string, RecordedCertificate>(StringComparer.Ordinal);
-
-        if (section.Data.TryGetPropertyValue(ClientCertificatesKey, out var node) && node is JsonObject entries)
-        {
-            foreach (var (consumer, entry) in entries)
+            if (File.Exists(path))
             {
-                if (entry is JsonObject values &&
-                    values[ThumbprintKey] is JsonValue thumbprint && thumbprint.TryGetValue<string>(out var thumbprintText) &&
-                    values[FileKey] is JsonValue file && file.TryGetValue<string>(out var fileText))
-                {
-                    certificates[consumer] = new RecordedCertificate(thumbprintText, fileText);
-                }
+                File.Delete(path);
             }
         }
-
-        return certificates;
     }
-
-    private static JsonObject GetClientCertificatesNode(DeploymentStateSection section)
-    {
-        if (section.Data[ClientCertificatesKey] is not JsonObject node)
-        {
-            node = [];
-            section.Data[ClientCertificatesKey] = node;
-        }
-
-        return node;
-    }
-
-    private sealed record RecordedCertificate(string Thumbprint, string File);
 
     /// <summary>The certificate comes as a zip bundle (pfx and pem files) or as a bare pfx.</summary>
     internal static byte[]? ExtractPfx(byte[] bundle)
@@ -676,6 +561,22 @@ internal sealed class RavenDBCloudProvisioner(
 
         return buffer.ToArray();
     }
+
+    private static bool IsSecured(RavenDBCloudDeployment deployment) =>
+        deployment.Endpoint.Url?.StartsWith("https://", StringComparison.OrdinalIgnoreCase) == true;
+
+    private static bool IsNamed(RegisteredCertificate certificate, string name) =>
+        string.Equals(certificate.Name, name, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsSame(string thumbprint, string? other) =>
+        string.Equals(thumbprint, other, StringComparison.OrdinalIgnoreCase);
+
+    private static bool GrantsExactly(RegisteredCertificate certificate, IReadOnlyDictionary<string, DatabaseAccess> permissions) =>
+        certificate.Permissions.Count == permissions.Count &&
+        permissions.All(p => certificate.Permissions.TryGetValue(p.Key, out var access) && access == p.Value);
+
+    private static string Describe(IReadOnlyList<string> databases) =>
+        databases.Count == 0 ? "no database" : string.Join(", ", databases);
 
     private static bool IsGone(string? status) =>
         status is ProductStatus.Terminated or ProductStatus.Terminating;

@@ -213,10 +213,13 @@ internal sealed class FakeRavenDBServer : IRavenDBServerAdministrationFactory
         public Task<bool> CreateDatabaseAsync(string database, int replicationFactor, CancellationToken cancellationToken) =>
             Task.FromResult(server.Databases.Add(database));
 
-        public Task<IReadOnlyDictionary<string, DatabaseAccess>?> GetCertificatePermissionsAsync(string thumbprint, CancellationToken cancellationToken) =>
-            Task.FromResult(server.Certificates.TryGetValue(thumbprint, out var certificate)
-                ? (IReadOnlyDictionary<string, DatabaseAccess>?)new Dictionary<string, DatabaseAccess>(certificate.Permissions)
-                : null);
+        public Task<IReadOnlyList<RegisteredCertificate>> GetCertificatesAsync(string namePrefix, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<RegisteredCertificate>>([.. server.Certificates
+                .Where(c => c.Value.Name.StartsWith(namePrefix, StringComparison.OrdinalIgnoreCase))
+                .Select(c => new RegisteredCertificate(
+                    c.Value.Name,
+                    c.Key,
+                    new Dictionary<string, DatabaseAccess>(c.Value.Permissions, StringComparer.OrdinalIgnoreCase)))]);
 
         public Task<byte[]> CreateClientCertificateAsync(string name, IReadOnlyDictionary<string, DatabaseAccess> permissions, CancellationToken cancellationToken)
         {

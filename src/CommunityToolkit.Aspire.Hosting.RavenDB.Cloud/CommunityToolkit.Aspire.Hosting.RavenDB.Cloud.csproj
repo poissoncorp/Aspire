@@ -5,6 +5,8 @@
     <AdditionalPackageTags>hosting ravendb cloud deployment</AdditionalPackageTags>
     <!-- Built on Aspire's pipeline APIs, which are still experimental. -->
     <IsPreview>true</IsPreview>
+    <!-- PublishAsRavenDBCloud takes an options callback, which polyglot AppHosts cannot pass. -->
+    <IsAspirePolyglotCompatible>false</IsAspirePolyglotCompatible>
     <NoWarn>$(NoWarn);ASPIREPIPELINES001;ASPIREPIPELINES002;ASPIREPIPELINES004</NoWarn>
   </PropertyGroup>
 

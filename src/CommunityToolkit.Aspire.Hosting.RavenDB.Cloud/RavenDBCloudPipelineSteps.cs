@@ -82,12 +82,14 @@ internal static class RavenDBCloudPipelineSteps
         var destroy = new PipelineStep
         {
             Name = DestroyStepName(server),
-            Description = $"Terminates the RavenDB Cloud product '{deployment.ProductName}' if this deployment created it",
+            Description = $"Revokes the client certificates of '{server.Name}' and terminates the RavenDB Cloud product '{deployment.ProductName}' if this deployment created it",
             Resource = server,
             Action = async context =>
             {
                 using var client = await CreateClientAsync(deployment, context).ConfigureAwait(false);
-                await CreateProvisioner(client, context).DestroyAsync(deployment, context.CancellationToken).ConfigureAwait(false);
+                await CreateProvisioner(client, context)
+                    .DestroyAsync(deployment, PlanClientCertificates(deployment, context, warnings: null), context.CancellationToken)
+                    .ConfigureAwait(false);
             },
         };
         destroy.DependsOn(WellKnownPipelineSteps.DestroyPrereq);
@@ -212,20 +214,35 @@ internal static class RavenDBCloudPipelineSteps
         }
     }
 
-    /// <summary>
-    /// Issues the client certificates of the applications deployed to Docker Compose, which mounts them from the
-    /// directory next to the compose file.
-    /// </summary>
     private static async Task IssueClientCertificatesAsync(RavenDBCloudDeployment deployment, PipelineStepContext context)
+    {
+        var plan = PlanClientCertificates(deployment, context, warnings: context.Logger);
+
+        using var client = await CreateClientAsync(deployment, context).ConfigureAwait(false);
+        await CreateProvisioner(client, context).EnsureClientCertificatesAsync(deployment, plan, context.CancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The certificates of the applications deployed to Docker Compose, which mounts them from the directory next to
+    /// the compose file. Applications that bring their own certificate get none.
+    /// </summary>
+    /// <param name="deployment">The product.</param>
+    /// <param name="context">The step.</param>
+    /// <param name="warnings">Where to report applications that get no certificate; <see langword="null"/> on destroy.</param>
+    private static ClientCertificatePlan PlanClientCertificates(RavenDBCloudDeployment deployment, PipelineStepContext context, ILogger? warnings)
     {
         var server = deployment.Server;
         var environments = context.Model.Resources.OfType<IComputeEnvironmentResource>().ToList();
         var outputService = context.Services.GetRequiredService<IPipelineOutputService>();
-        var hostEnvironment = context.Services.GetService<IHostEnvironment>();
-        var environmentName = hostEnvironment?.EnvironmentName ?? "Production";
+        var host = context.Services.GetService<IHostEnvironment>();
+        var prefix = RavenDBCloudClientCertificates.NamePrefix(host?.ApplicationName ?? "apphost", host?.EnvironmentName ?? "Production");
+
+        string DirectoryOf(IComputeEnvironmentResource environment) =>
+            Path.Combine(GetOutputDirectory(outputService, environment, environments.Count), RavenDBCloudClientCertificates.DirectoryName);
+
         var requests = new List<ClientCertificateRequest>();
 
-        foreach (var consumer in RavenDBConsumers.Find(context.Model, server))
+        foreach (var consumer in RavenDBConsumers.Find(context.Model, server).Where(c => !c.BringsOwnCertificate))
         {
             var target = consumer.Resource.Annotations.OfType<DeploymentTargetAnnotation>().FirstOrDefault()?.ComputeEnvironment;
 
@@ -233,7 +250,7 @@ internal static class RavenDBCloudPipelineSteps
             {
                 if (target is not null)
                 {
-                    context.Logger.LogWarning(
+                    warnings?.LogWarning(
                         "'{Resource}' is deployed to '{Environment}', which does not get a RavenDB client certificate from this " +
                         "integration. Provide one for '{Server}' through Aspire:RavenDB:Client:{Connection}:CertificatePath.",
                         consumer.Resource.Name,
@@ -247,24 +264,23 @@ internal static class RavenDBCloudPipelineSteps
 
             if (consumer.Databases.Count == 0)
             {
-                context.Logger.LogWarning(
+                warnings?.LogWarning(
                     "'{Resource}' references '{Server}', which declares no database: its certificate grants access to no " +
                     "database. Declare the databases with AddDatabase(...).",
                     consumer.Resource.Name,
                     server.Name);
             }
 
-            var directory = Path.Combine(GetOutputDirectory(outputService, target, environments.Count), RavenDBCloudClientCertificates.DirectoryName);
-
             requests.Add(new ClientCertificateRequest(
                 consumer.Resource.Name,
-                $"aspire.{hostEnvironment?.ApplicationName ?? "apphost"}.{environmentName}.{consumer.Resource.Name}".ToLowerInvariant(),
+                (prefix + consumer.Resource.Name).ToLowerInvariant(),
                 consumer.Databases,
-                Path.Combine(directory, RavenDBCloudClientCertificates.FileName(server, consumer.Resource))));
+                Path.Combine(DirectoryOf(target), RavenDBCloudClientCertificates.FileName(server, consumer.Resource.Name))));
         }
 
-        using var client = await CreateClientAsync(deployment, context).ConfigureAwait(false);
-        await CreateProvisioner(client, context).EnsureClientCertificatesAsync(deployment, requests, context.CancellationToken).ConfigureAwait(false);
+        var directories = environments.OfType<DockerComposeEnvironmentResource>().Select(DirectoryOf).Distinct().ToList();
+
+        return new ClientCertificatePlan(prefix, directories, requests);
     }
 
     private static string GetOutputDirectory(IPipelineOutputService outputService, IComputeEnvironmentResource environment, int environmentCount) =>

@@ -68,6 +68,16 @@ var db = builder.AddRavenDB("ravendb")
 
 Databases declared with `ensureCreated` are not created on an existing server.
 
+The server belongs to someone else, so its owner issues the applications' client certificates, each with access to that application's databases only. Give each application its certificate; the RavenDB client integration picks it up through `Aspire__RavenDB__Client__<connection name>__CertificatePath`, with no application code:
+
+```csharp
+builder.AddProject<Projects.Api>("api")
+    .WithReference(db)
+    .WithRavenDBClientCertificateFile(db, "certs/api.pfx"); // Docker Compose: mounted as a secret
+```
+
+In Kubernetes, `WithRavenDBClientCertificateSecret(db, "api-cert", "ravendb-ca")` from [CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes](https://www.nuget.org/packages/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes) mounts an existing Secret instead.
+
 ### Checks at publish time
 
 `aspire publish` stops before writing any file when:

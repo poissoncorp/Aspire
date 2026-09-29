@@ -57,6 +57,48 @@ public class RavenDBCloudPublishTests
     }
 
     [Fact]
+    public async Task ApplicationThatBringsItsCertificateGetsNoneIssued()
+    {
+        var output = Directory.CreateTempSubdirectory(".ravendb-cloud-publish-test");
+
+        try
+        {
+            using var builder = TestDistributedApplicationBuilder.Create(
+                "AppHost:Operation=publish", $"Pipeline:OutputPath={output.FullName}", "Pipeline:Step=publish");
+
+            builder.Configuration["Parameters:ravendb-cloud-api-key"] = "test-api-key";
+            builder.AddDockerComposeEnvironment("compose");
+
+            var orders = builder.AddRavenDB("ravendb")
+                .PublishAsRavenDBCloud(builder.AddParameter("ravendb-cloud-api-key", secret: true), cloud => cloud.WithAllowedIps("203.0.113.0/24"))
+                .AddDatabase("orders");
+
+            var owned = Path.Combine(output.FullName, "api.pfx");
+            builder.AddContainer("api", "busybox").WithReference(orders).WithRavenDBClientCertificateFile(orders, owned);
+            builder.AddContainer("worker", "busybox").WithReference(orders);
+
+            using var app = builder.Build();
+            await app.RunAsync(TestContext.Current.CancellationToken);
+
+            var compose = File.ReadAllText(Path.Combine(output.FullName, "docker-compose.yaml")).ReplaceLineEndings("\n");
+
+            Assert.Contains($"""
+                  ravendb-ravendb-api-certificate:
+                    file: "{owned.Replace("\\", "\\\\")}"
+                """.ReplaceLineEndings("\n"), compose);
+            Assert.Contains("""
+                  ravendb-ravendb-worker-certificate:
+                    file: "./ravendb-certs/ravendb-worker.pfx"
+                """.ReplaceLineEndings("\n"), compose);
+            Assert.DoesNotContain("ravendb-certs/ravendb-api.pfx", compose);
+        }
+        finally
+        {
+            output.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public void ConsumersAreTheResourcesThatReferenceTheServerOrItsDatabases()
     {
         using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);

@@ -41,8 +41,7 @@ public enum RavenDBCloudStorageType
 /// </summary>
 /// <remarks>
 /// A product is looked up by <see cref="ProductName"/>. When it does not exist, the deployment creates it from the
-/// remaining options, unless <see cref="AsExisting(string)"/> was called. Options left unset are resolved from the
-/// Cloud API metadata at deploy time.
+/// remaining options; options left unset are resolved from the Cloud API metadata at deploy time.
 /// </remarks>
 public sealed class RavenDBCloudOptions
 {
@@ -99,25 +98,6 @@ public sealed class RavenDBCloudOptions
     /// terminating a product deletes its data.
     /// </summary>
     public bool TerminateOnDestroy { get; set; }
-
-    /// <summary>Whether the product belongs to someone else and must never be created, changed or terminated.</summary>
-    internal bool IsExisting { get; private set; }
-
-    /// <summary>
-    /// Uses a product that already exists in the account. The deployment only connects the application to it and
-    /// fails when no product has this name, instead of creating an empty one.
-    /// </summary>
-    /// <param name="productName">Display name of the product in the account.</param>
-    /// <returns>These options, for chaining.</returns>
-    public RavenDBCloudOptions AsExisting(string productName)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(productName);
-
-        ProductName = productName;
-        IsExisting = true;
-
-        return this;
-    }
 
     /// <summary>Allows the given IP ranges to reach the product.</summary>
     /// <param name="allowedIps">IP ranges in CIDR notation.</param>

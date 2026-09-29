@@ -72,23 +72,29 @@ builder.AddRavenDBClient("mydb");
 
 With a certificate authority of its own, the application trusts it through `SSL_CERT_DIR`, next to the image's own trusted roots. The applications never get the admin certificate.
 
-The Job runs again whenever its configuration changes. It keeps existing certificates, updates their access, and registers them again if they were removed from RavenDB. The Secrets belong to the chart's ServiceAccount, so uninstalling the chart removes them.
+The Job runs again whenever its configuration changes and leaves every application with exactly one certificate. It keeps the certificate in the application's Secret, updates its access, and registers it again if it was removed from RavenDB. It revokes every other certificate with the application's name, as well as those of applications that are no longer deployed: every certificate under `aspire.<namespace>.` belongs to the integration. The Secrets belong to the chart's ServiceAccount, so uninstalling the chart removes them.
 
-### An existing server
+### A server someone else runs
 
-For a RavenDB server that runs outside the application, typically a cluster the operator runs for several applications, the chart only gets the bootstrap Job and the applications' certificates. No database is created:
+For a RavenDB server that runs outside the application, such as a cluster a platform team runs for several applications, its owner issues each application a certificate for its databases, and the chart only mounts it. It gets no admin certificate, no Job and no database:
 
 ```csharp
 var url = builder.AddParameter("ravendb-url"); // https://a.ravendb.example.com:443
 
 var db = builder.AddRavenDB("ravendb")
-    .PublishAsExistingRavenDBCluster(url, "ravendb-admin", "ravendb-ca")
+    .PublishAsExisting(url)
     .AddDatabase("mydb");
+
+builder.AddProject<Projects.Api>("api")
+    .WithReference(db)
+    .WithRavenDBClientCertificateSecret(db, "api-cert", "ravendb-ca");
 ```
+
+`api-cert` holds the application's certificate under `client.pfx`, and the optional `ravendb-ca` the server's certificate authority under `ca.crt`. An application of a cluster published with `PublishAsRavenDBCluster` can bring its certificate the same way; the bootstrap then issues it none.
 
 ### Destroy
 
-`aspire destroy` uninstalls the chart. The operator removes the cluster; the data volumes stay, as with every StatefulSet, and certificates registered in an existing server stay registered.
+`aspire destroy` uninstalls the chart. The operator removes the cluster; the data volumes stay, as with every StatefulSet.
 
 The RavenDB operator (2.0.0) cannot start a cluster again on the volumes of a removed one: its initialization Job fails on nodes that already form a cluster, and the cluster stays in its Error phase. Delete its volumes, `ravendb-data-ravendb-<tag>-0`, before deploying again; this deletes the data.
 

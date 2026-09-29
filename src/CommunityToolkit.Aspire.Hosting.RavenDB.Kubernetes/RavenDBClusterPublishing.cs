@@ -38,7 +38,7 @@ internal static partial class RavenDBClusterPublishing
         var server = builder.Resource;
         var applicationBuilder = builder.ApplicationBuilder;
 
-        server.PublishAsExternal(deployment.Url, createsDatabases: !deployment.IsExisting);
+        server.PublishAsExternal(deployment.Url, createsDatabases: true);
         builder
             .WithAnnotation(deployment)
             .WithPipelineStepFactory(_ => RavenDBClusterPipelineSteps.Create(deployment))
@@ -50,7 +50,7 @@ internal static partial class RavenDBClusterPublishing
         var bootstrap = applicationBuilder.AddContainer(deployment.BootstrapName, image, tag)
             .WithEntrypoint("/bin/bash")
             .WithArgs(ScriptPath)
-            .WithEnvironment("RAVENDB_URLS", deployment.IsExisting ? deployment.Url : ReferenceExpression.Create($"{string.Join(' ', deployment.NodeUrls)}"))
+            .WithEnvironment("RAVENDB_URLS", string.Join(' ', deployment.NodeUrls))
             .WithEnvironment(context =>
             {
                 // Evaluated when the chart is written: databases and references declared after this call count.
@@ -60,7 +60,7 @@ internal static partial class RavenDBClusterPublishing
                 }
 
                 // Carried to the operator's license Secret, see ApplyToBootstrap.
-                if (!deployment.IsExisting && deployment.Options!.LicenseSecretName is null && server.LicenseParameter is { } license)
+                if (deployment.Options.LicenseSecretName is null && server.LicenseParameter is { } license)
                 {
                     context.EnvironmentVariables[LicenseVariable] = license;
                 }
@@ -71,16 +71,21 @@ internal static partial class RavenDBClusterPublishing
         {
             Validate(@event.Model, deployment);
 
+            // An application that brings its own certificate gets it from WithRavenDBClientCertificateSecret.
             deployment.Consumers = RavenDBConsumers.Find(@event.Model, server)
-                .Where(c => !ReferenceEquals(c.Resource, bootstrap.Resource))
+                .Where(c => !c.BringsOwnCertificate && !ReferenceEquals(c.Resource, bootstrap.Resource))
                 .ToList();
 
             foreach (var consumer in deployment.Consumers)
             {
                 if (consumer.Resource is IComputeResource compute)
                 {
-                    applicationBuilder.CreateResourceBuilder(compute)
-                        .PublishAsKubernetesService(k8s => ApplyToConsumer(k8s, deployment, consumer));
+                    applicationBuilder.CreateResourceBuilder(compute).PublishAsKubernetesService(k8s => RavenDBKubernetesCertificates.Mount(
+                        k8s,
+                        server,
+                        consumer,
+                        deployment.ApplicationSecretName(consumer.Resource),
+                        deployment.CertificateAuthoritySecret));
                 }
             }
 
@@ -91,10 +96,9 @@ internal static partial class RavenDBClusterPublishing
     /// <summary>The bootstrap's settings, apart from the URLs and the license.</summary>
     private static SortedDictionary<string, string> Settings(RavenDBClusterDeployment deployment) => new(StringComparer.Ordinal)
     {
-        ["RAVENDB_WAIT_FOR_NODES"] = deployment.IsExisting ? "false" : "true",
         ["RAVENDB_SECRET_OWNER"] = deployment.BootstrapName,
-        ["RAVENDB_DATABASES"] = deployment.IsExisting ? string.Empty : string.Join(' ', deployment.Server.DatabasesToCreate),
-        ["RAVENDB_REPLICATION_FACTOR"] = (deployment.Options?.Nodes ?? 1).ToString(CultureInfo.InvariantCulture),
+        ["RAVENDB_DATABASES"] = string.Join(' ', deployment.Server.DatabasesToCreate),
+        ["RAVENDB_REPLICATION_FACTOR"] = deployment.Options.Nodes.ToString(CultureInfo.InvariantCulture),
         ["RAVENDB_APPLICATIONS"] = string.Join(' ', deployment.Consumers.Select(c =>
             $"{deployment.ApplicationSecretName(c.Resource)}={string.Join(',', c.Databases)}")),
     };
@@ -110,14 +114,9 @@ internal static partial class RavenDBClusterPublishing
                 "environment. Add one with builder.AddKubernetesEnvironment(...).");
         }
 
-        if (deployment.IsExisting)
-        {
-            return;
-        }
-
         var clusters = model.Resources
             .OfType<RavenDBServerResource>()
-            .Where(r => r.Annotations.OfType<RavenDBClusterDeployment>().Any(d => !d.IsExisting))
+            .Where(r => r.Annotations.OfType<RavenDBClusterDeployment>().Any())
             .Select(r => r.Name)
             .ToList();
 
@@ -137,7 +136,7 @@ internal static partial class RavenDBClusterPublishing
                 "tag with Image (for example ravendb/ravendb:7.2.6-ubuntu.24.04-x64) or WithImageTag(...).");
         }
 
-        if (deployment.Options!.LicenseSecretName is null && server.LicenseParameter is null)
+        if (deployment.Options.LicenseSecretName is null && server.LicenseParameter is null)
         {
             throw new DistributedApplicationException(
                 $"The RavenDB operator reads the license of '{server.Name}' from a Secret. Pass the license as a " +
@@ -147,7 +146,7 @@ internal static partial class RavenDBClusterPublishing
 
     private static (string Image, string Tag) ResolveImage(RavenDBClusterDeployment deployment)
     {
-        var image = deployment.Options?.Image;
+        var image = deployment.Options.Image;
 
         if (image is null)
         {
@@ -227,66 +226,18 @@ internal static partial class RavenDBClusterPublishing
         k8s.AdditionalResources.Add(script);
 
         k8s.AdditionalResources.AddRange(CreateAccess(deployment));
+        k8s.AdditionalResources.Add(CreateCluster(deployment));
 
-        if (deployment.Options is { } options)
+        if (deployment.Options.LicenseSecretName is null)
         {
-            k8s.AdditionalResources.Add(CreateCluster(deployment, options));
-
-            if (options.LicenseSecretName is null)
-            {
-                k8s.AdditionalResources.Add(CreateLicenseSecret(deployment, license));
-            }
+            k8s.AdditionalResources.Add(CreateLicenseSecret(deployment, license));
         }
     }
 
-    /// <summary>
-    /// Mounts the application's certificate (and the certificate authority, when the cluster has its own) and points
-    /// the RavenDB client integration at it.
-    /// </summary>
-    internal static void ApplyToConsumer(KubernetesResource k8s, RavenDBClusterDeployment deployment, RavenDBConsumer consumer)
+    private static RavenDBClusterManifest CreateCluster(RavenDBClusterDeployment deployment)
     {
-        if (k8s.Workload?.PodTemplate?.Spec is not { } pod)
-        {
-            return;
-        }
+        var options = deployment.Options;
 
-        var certificateVolume = $"{deployment.ResourceName}-client-certificate";
-        var certificateAuthorityVolume = $"{deployment.ResourceName}-certificate-authority";
-
-        pod.Volumes.Add(new VolumeV1
-        {
-            Name = certificateVolume,
-            Secret = new SecretVolumeSourceV1 { SecretName = deployment.ApplicationSecretName(consumer.Resource) },
-        });
-
-        if (deployment.CertificateAuthoritySecret is { } certificateAuthority)
-        {
-            pod.Volumes.Add(new VolumeV1 { Name = certificateAuthorityVolume, Secret = new SecretVolumeSourceV1 { SecretName = certificateAuthority } });
-        }
-
-        foreach (var container in pod.Containers)
-        {
-            container.VolumeMounts.Add(new VolumeMountV1 { Name = certificateVolume, MountPath = deployment.CertificateDirectory, ReadOnly = true });
-
-            foreach (var connectionName in consumer.ConnectionNames)
-            {
-                container.Env.Add(new EnvVarV1 { Name = RavenDBConsumers.CertificatePathVariable(connectionName), Value = deployment.CertificatePath });
-            }
-
-            if (deployment.CertificateAuthoritySecret is not null)
-            {
-                container.VolumeMounts.Add(new VolumeMountV1 { Name = certificateAuthorityVolume, MountPath = deployment.CertificateAuthorityDirectory, ReadOnly = true });
-
-                // .NET on Linux reads its trusted roots from the directories in SSL_CERT_DIR: keep the image's own
-                // and add the cluster's certificate authority.
-                container.Env.RemoveAll(e => e.Name == "SSL_CERT_DIR");
-                container.Env.Add(new EnvVarV1 { Name = "SSL_CERT_DIR", Value = $"/etc/ssl/certs:{deployment.CertificateAuthorityDirectory}" });
-            }
-        }
-    }
-
-    private static RavenDBClusterManifest CreateCluster(RavenDBClusterDeployment deployment, RavenDBClusterOptions options)
-    {
         var cluster = new RavenDBClusterManifest
         {
             Spec =
@@ -298,7 +249,7 @@ internal static partial class RavenDBClusterPublishing
                 LicenseSecretRef = deployment.LicenseSecretName,
                 ClientCertSecretRef = deployment.ClientCertificateSecret,
                 ClusterCertSecretRef = options.ServerCertificateSecret,
-                CaCertSecretRef = options.CertificateAuthoritySecret,
+                CaCertSecretRef = deployment.CertificateAuthoritySecret,
                 Nodes = [.. Enumerable.Range(0, options.Nodes).Select(i => new RavenDBClusterNode
                 {
                     Tag = RavenDBClusterDeployment.NodeTag(i),

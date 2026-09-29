@@ -30,6 +30,12 @@ internal static partial class RavenDBClusterPipelineSteps
     /// </summary>
     public static TimeSpan WatchTimeout { get; set; } = TimeSpan.FromMinutes(5.5);
 
+    /// <summary>
+    /// Helm creates the chart's objects within seconds of starting: a bootstrap Job that has not appeared by then means
+    /// Helm failed before installing anything, and there is nothing left to watch.
+    /// </summary>
+    private static readonly TimeSpan s_jobAppearanceTimeout = TimeSpan.FromMinutes(2);
+
     public static TimeSpan PollInterval { get; set; } = TimeSpan.FromSeconds(10);
 
     public static IEnumerable<PipelineStep> Create(RavenDBClusterDeployment deployment)
@@ -112,23 +118,25 @@ internal static partial class RavenDBClusterPipelineSteps
         }
 
         var kubectl = await Kubectl.CreateAsync(environment, context.CancellationToken).ConfigureAwait(false);
-        var deadline = DateTimeOffset.UtcNow + WatchTimeout;
+        var start = DateTimeOffset.UtcNow;
         var reportedRestarts = 0;
 
-        while (DateTimeOffset.UtcNow < deadline)
+        while (DateTimeOffset.UtcNow < start + WatchTimeout)
         {
-            var phase = deployment.IsExisting
-                ? "Running"
-                : (await kubectl.RunAsync(
-                    ["get", "ravendbcluster", deployment.ResourceName, "--ignore-not-found", "-o", "jsonpath={.status.phase}"],
-                    context.CancellationToken, throwOnError: false).ConfigureAwait(false)).Trim();
+            var phase = await GetClusterPhaseAsync(kubectl, deployment, context.CancellationToken).ConfigureAwait(false);
 
-            var conditions = await kubectl.RunAsync(
-                ["get", "job", job, "--ignore-not-found", "-o", "jsonpath={range .status.conditions[*]}{.type}={.status};{end}"],
+            // "<name>:<type>=<status>;..." once the Job exists, empty before.
+            var state = await kubectl.RunAsync(
+                ["get", "job", job, "--ignore-not-found", "-o", "jsonpath={.metadata.name}:{range .status.conditions[*]}{.type}={.status};{end}"],
                 context.CancellationToken, throwOnError: false).ConfigureAwait(false);
 
+            if (state.Length == 0 && DateTimeOffset.UtcNow > start + s_jobAppearanceTimeout)
+            {
+                return;
+            }
+
             // Helm waits for the cluster as well as for the applications the Job gives their certificates to.
-            if (phase == "Running" && (conditions.Contains("Complete=True", StringComparison.Ordinal) || conditions.Contains("Failed=True", StringComparison.Ordinal)))
+            if (phase == "Running" && (state.Contains("Complete=True", StringComparison.Ordinal) || state.Contains("Failed=True", StringComparison.Ordinal)))
             {
                 return;
             }
@@ -162,6 +170,13 @@ internal static partial class RavenDBClusterPipelineSteps
             await Task.Delay(PollInterval, context.CancellationToken).ConfigureAwait(false);
         }
     }
+
+    /// <returns>The phase the operator reports for the cluster, or an empty string before it reports one.</returns>
+    private static async Task<string> GetClusterPhaseAsync(Kubectl kubectl, RavenDBClusterDeployment deployment, CancellationToken cancellationToken) =>
+        (await kubectl.RunAsync(
+            ["get", "ravendbcluster", deployment.ResourceName, "--ignore-not-found", "-o", "jsonpath={.status.phase}"],
+            cancellationToken,
+            throwOnError: false).ConfigureAwait(false)).Trim();
 
     private static async Task ReportClusterErrorAsync(RavenDBClusterDeployment deployment, Kubectl kubectl, PipelineStepContext context)
     {
@@ -266,14 +281,12 @@ internal static partial class RavenDBClusterPipelineSteps
             {
                 lastReport = DateTimeOffset.UtcNow;
 
-                var phase = deployment.IsExisting
-                    ? null
-                    : await kubectl.RunAsync(["get", "ravendbcluster", deployment.ResourceName, "-o", "jsonpath={.status.phase}"], context.CancellationToken, throwOnError: false).ConfigureAwait(false);
+                var phase = await GetClusterPhaseAsync(kubectl, deployment, context.CancellationToken).ConfigureAwait(false);
 
                 context.Logger.LogInformation(
                     "Waiting for the RavenDB bootstrap Job '{Job}'{Phase}.",
                     job,
-                    string.IsNullOrWhiteSpace(phase) ? string.Empty : $" (cluster: {phase.Trim()})");
+                    phase.Length == 0 ? string.Empty : $" (cluster: {phase})");
             }
 
             await Task.Delay(PollInterval, context.CancellationToken).ConfigureAwait(false);

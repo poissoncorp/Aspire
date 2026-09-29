@@ -40,6 +40,13 @@ namespace Aspire.Hosting
         [AspireExport]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> WithLogVolume(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, string? name = null, bool isReadOnly = false) { throw null; }
     }
+
+    public static partial class RavenDBClientCertificateExtensions
+    {
+        [AspireExport("withRavenDBDatabaseClientCertificateFile", MethodName = "withRavenDBClientCertificateFile")]
+        public static ApplicationModel.IResourceBuilder<T> WithRavenDBClientCertificateFile<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBDatabaseResource> database, string path)
+            where T : ApplicationModel.IComputeResource { throw null; }
+    }
 }
 
 namespace Aspire.Hosting.ApplicationModel
