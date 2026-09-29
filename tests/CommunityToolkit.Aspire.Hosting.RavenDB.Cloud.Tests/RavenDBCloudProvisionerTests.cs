@@ -30,6 +30,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
         Assert.Equal("Stable", request["releaseChannel"]!.GetValue<string>());
         Assert.Equal("SsdStandard", request["storageTypeName"]!.GetValue<string>());
         Assert.Equal("203.0.113.0/24", request["allowedIps"]![0]!.GetValue<string>());
+        Assert.Equal(RavenDBCloudDeployment.DeriveSubdomain("ravendb-production"), request["subdomainName"]!.GetValue<string>());
 
         Assert.Equal("https://a.ravendb-production.development.run", deployment.Endpoint.Url);
         Assert.All(_api.ApiKeys, key => Assert.Equal("test-api-key", key));
@@ -37,6 +38,20 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
         var section = _state[deployment.StateSectionName]!;
         Assert.Equal(deployment.ProductId, section["productId"]!.GetValue<string>());
         Assert.True(section["createdByDeployment"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public async Task CreatesTheProductWithTheGivenSubdomain()
+    {
+        var deployment = CreateDeployment(o =>
+        {
+            o.Subdomain = "shop";
+            o.WithAllowedIps("203.0.113.0/24");
+        });
+
+        await Provision(deployment);
+
+        Assert.Equal("shop", Assert.Single(_api.CreateRequests)["subdomainName"]!.GetValue<string>());
     }
 
     [Fact]

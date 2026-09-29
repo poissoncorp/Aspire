@@ -37,7 +37,8 @@ internal sealed class FakeRavenDBCloudApi : HttpMessageHandler, IRavenDBCloudApi
     public FakeProduct AddProduct(string name, string status = "Active")
     {
         var id = $"product-{Interlocked.Increment(ref _nextId)}";
-        var product = new FakeProduct(id, name) { Status = status, Dns = [$"https://a.{name}.development.run"] };
+        // Host names without a scheme, as the real API reports them.
+        var product = new FakeProduct(id, name) { Status = status, Dns = [$"a.{name}.development.run"] };
         Products[id] = product;
         return product;
     }
@@ -50,6 +51,12 @@ internal sealed class FakeRavenDBCloudApi : HttpMessageHandler, IRavenDBCloudApi
         lock (ApiKeys)
         {
             ApiKeys.Add(request.Headers.TryGetValues("X-Api-Key", out var keys) ? keys.Single() : "");
+        }
+
+        // As the real API's gateway does.
+        if (request.Headers.UserAgent.Count == 0)
+        {
+            return new HttpResponseMessage(System.Net.HttpStatusCode.Forbidden) { Content = new StringContent("<html>403 Forbidden</html>") };
         }
 
         var path = request.RequestUri!.AbsolutePath;
@@ -90,7 +97,21 @@ internal sealed class FakeRavenDBCloudApi : HttpMessageHandler, IRavenDBCloudApi
                 CreateRequests.Add(body);
             }
 
+            // As the real API validates it: the OpenAPI document marks it optional, paid tiers require it.
+            var subdomain = body["subdomainName"]?.GetValue<string>();
+
+            if (string.IsNullOrEmpty(subdomain) && body["tier"]?.GetValue<string>() != "Free")
+            {
+                return Json(new { subdomainName = new[] { "Subdomain Name is required.", "Domain name cannot be empty." } }, HttpStatusCode.BadRequest);
+            }
+
+            if (Products.Values.Any(p => p.Subdomain == subdomain))
+            {
+                return Json(new { subdomainName = new[] { "Subdomain is already taken." } }, HttpStatusCode.BadRequest);
+            }
+
             var product = AddProduct(body["displayName"]!.GetValue<string>(), status: "Creating");
+            product.Subdomain = subdomain;
             return Json(new { productId = product.Id }, HttpStatusCode.Accepted);
         }
 
@@ -148,6 +169,8 @@ internal sealed class FakeProduct(string id, string name)
     public string Id { get; } = id;
 
     public string Name { get; } = name;
+
+    public string? Subdomain { get; set; }
 
     public string Status { get; set; } = "Active";
 

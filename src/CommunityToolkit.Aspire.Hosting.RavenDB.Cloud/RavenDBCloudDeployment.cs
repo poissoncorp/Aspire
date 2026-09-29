@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using Aspire.Hosting.ApplicationModel;
 
 namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud;
@@ -14,8 +16,12 @@ internal sealed class RavenDBCloudDeployment : IResourceAnnotation
         ApiKey = apiKey;
         Options = options;
         ProductName = options.ProductName ?? $"{server.Name}-{environmentName}".ToLowerInvariant();
+        Subdomain = options.Subdomain ?? DeriveSubdomain(ProductName);
         Endpoint = new RavenDBCloudEndpoint(server.Name);
     }
+
+    /// <summary>The longest subdomain RavenDB Cloud accepts.</summary>
+    public const int MaxSubdomainLength = 13;
 
     public RavenDBServerResource Server { get; }
 
@@ -25,6 +31,35 @@ internal sealed class RavenDBCloudDeployment : IResourceAnnotation
 
     /// <summary>Display name the product is looked up and created by.</summary>
     public string ProductName { get; }
+
+    /// <summary>Subdomain a new product is created with.</summary>
+    public string Subdomain { get; }
+
+    /// <summary>
+    /// The product name's letters, digits and dashes; when that is too long, its beginning and a hash of the whole
+    /// name, so <c>ravendb-staging</c> and <c>ravendb-production</c> still get different subdomains.
+    /// </summary>
+    internal static string DeriveSubdomain(string productName)
+    {
+        var allowed = new string([.. productName.ToLowerInvariant().Where(c => c is (>= 'a' and <= 'z') or (>= '0' and <= '9') or '-')]).Trim('-');
+
+        if (allowed.Length is > 0 and <= MaxSubdomainLength)
+        {
+            return allowed;
+        }
+
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(productName)))[..5].ToLowerInvariant();
+        var prefix = allowed[..Math.Min(allowed.Length, MaxSubdomainLength - hash.Length - 1)].TrimEnd('-');
+
+        return prefix.Length == 0 ? $"p{hash}" : $"{prefix}-{hash}";
+    }
+
+    /// <summary>Whether RavenDB Cloud accepts <paramref name="subdomain"/>.</summary>
+    internal static bool IsValidSubdomain(string subdomain) =>
+        subdomain.Length is > 0 and <= MaxSubdomainLength &&
+        subdomain.All(c => char.IsAsciiLetterOrDigit(c) || c == '-') &&
+        !subdomain.StartsWith('-') &&
+        !subdomain.EndsWith('-');
 
     /// <summary>The product URL, resolved by the provisioning step.</summary>
     public RavenDBCloudEndpoint Endpoint { get; }

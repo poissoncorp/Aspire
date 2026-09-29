@@ -121,6 +121,39 @@ public class RavenDBCloudPublishTests
         Assert.Equal("RAVENDB_URL", RavenDBCloudPipelineSteps.ToEnvironmentVariableName(deployment.Endpoint.ValueExpression));
     }
 
+    [Theory]
+    [InlineData("orders", "orders")]
+    [InlineData("My_Orders.Prod", "myordersprod")]
+    public void SubdomainIsTheProductNameWhenItFits(string productName, string expected) =>
+        Assert.Equal(expected, RavenDBCloudDeployment.DeriveSubdomain(productName));
+
+    [Fact]
+    public void SubdomainOfALongProductNameIsShortenedWithAHash()
+    {
+        var staging = CreateDeployment("Staging").Subdomain;
+        var production = CreateDeployment("Production").Subdomain;
+
+        Assert.StartsWith("ravendb-", production);
+        Assert.Equal(RavenDBCloudDeployment.MaxSubdomainLength, production.Length);
+        Assert.True(RavenDBCloudDeployment.IsValidSubdomain(production));
+        Assert.NotEqual(staging, production);
+    }
+
+    [Theory]
+    [InlineData("-shop")]
+    [InlineData("shop-")]
+    [InlineData("my_shop")]
+    [InlineData("fourteen-chars")]
+    public void InvalidSubdomainIsRejectedRightAway(string subdomain)
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+
+        var exception = Assert.Throws<ArgumentException>(() => builder.AddRavenDB("ravendb")
+            .PublishAsRavenDBCloud(builder.AddParameter("ravendb-cloud-api-key", secret: true), cloud => cloud.Subdomain = subdomain));
+
+        Assert.Equal("configure", exception.ParamName);
+    }
+
     [Fact]
     public void StepsHaveStableNamesAndDependencies()
     {

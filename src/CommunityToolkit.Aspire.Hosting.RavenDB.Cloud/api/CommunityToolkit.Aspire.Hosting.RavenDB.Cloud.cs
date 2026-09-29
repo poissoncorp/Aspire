@@ -42,6 +42,8 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud
 
         public RavenDBCloudStorageType StorageType { get { throw null; } set { } }
 
+        public string? Subdomain { get { throw null; } set { } }
+
         public bool TerminateOnDestroy { get { throw null; } set { } }
 
         public RavenDBCloudTier Tier { get { throw null; } set { } }

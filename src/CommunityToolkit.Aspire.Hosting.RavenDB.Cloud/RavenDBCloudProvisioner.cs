@@ -52,13 +52,14 @@ internal sealed class RavenDBCloudProvisioner(
             var request = await BuildCreateRequestAsync(deployment, cancellationToken).ConfigureAwait(false);
 
             logger.LogInformation(
-                "Creating RavenDB Cloud product '{Product}' ({Tier}, {Provider} {Region}, {Instance}, {Disk} GB).",
+                "Creating RavenDB Cloud product '{Product}' ({Tier}, {Provider} {Region}, {Instance}, {Disk} GB, subdomain {Subdomain}).",
                 request.DisplayName,
                 request.Tier,
                 request.CloudProvider,
                 request.Region,
                 request.InstanceTypeName,
-                request.DiskSize);
+                request.DiskSize,
+                request.SubdomainName);
 
             productId = await client.CreateProductAsync(request, cancellationToken).ConfigureAwait(false);
             createdByDeployment = true;
@@ -488,6 +489,7 @@ internal sealed class RavenDBCloudProvisioner(
             InstanceTypeName: instanceType,
             DisplayName: deployment.ProductName,
             ReleaseChannel: releaseChannel,
+            SubdomainName: deployment.Subdomain,
             Tier: options.Tier.ToString(),
             Region: options.Region,
             DiskSize: diskSize.Value,

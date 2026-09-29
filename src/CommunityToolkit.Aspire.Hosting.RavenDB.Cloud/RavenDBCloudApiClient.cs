@@ -41,7 +41,14 @@ internal sealed class RavenDBCloudApiClient : IDisposable
         _http.Timeout = TimeSpan.FromSeconds(100);
         _http.DefaultRequestHeaders.Add("X-Api-Key", apiKey);
         _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+        // The Cloud API's gateway answers requests without a User-Agent, which HttpClient does not send, with 403.
+        _http.DefaultRequestHeaders.UserAgent.Add(UserAgent);
     }
+
+    internal static ProductInfoHeaderValue UserAgent { get; } = new(
+        "CommunityToolkit.Aspire.Hosting.RavenDB.Cloud",
+        typeof(RavenDBCloudApiClient).Assembly.GetName().Version?.ToString(3) ?? "1.0.0");
 
     /// <summary>GET /api/v1/products/list.</summary>
     public async Task<IReadOnlyList<ProductListItem>> ListProductsAsync(CancellationToken cancellationToken)
@@ -138,9 +145,15 @@ internal sealed class RavenDBCloudApiClient : IDisposable
 
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
 
-        var hint = response.StatusCode == HttpStatusCode.Unauthorized
-            ? " Check the RavenDB Cloud API key."
-            : string.Empty;
+        var hint = response.StatusCode switch
+        {
+            HttpStatusCode.Unauthorized => " Check the RavenDB Cloud API key.",
+
+            // The API's answer when the account already holds its quota of paid products (three by default).
+            HttpStatusCode.PreconditionFailed =>
+                " The account has reached its quota of paid products: terminate one in the RavenDB Cloud portal, or ask support to raise the quota.",
+            _ => string.Empty,
+        };
 
         throw new InvalidOperationException(
             $"RavenDB Cloud API failed to {operation}: {(int)response.StatusCode} {response.ReasonPhrase}.{hint} {body}".TrimEnd());
@@ -164,6 +177,7 @@ internal sealed record ProductCreateRequest(
     string InstanceTypeName,
     string DisplayName,
     string ReleaseChannel,
+    string SubdomainName,
     string Tier,
     string Region,
     int DiskSize,

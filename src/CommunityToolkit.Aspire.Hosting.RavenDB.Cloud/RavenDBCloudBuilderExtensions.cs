@@ -57,6 +57,14 @@ public static class RavenDBCloudBuilderExtensions
         var options = new RavenDBCloudOptions();
         configure?.Invoke(options);
 
+        if (options.Subdomain is { } subdomain && !RavenDBCloudDeployment.IsValidSubdomain(subdomain))
+        {
+            throw new ArgumentException(
+                $"RavenDB Cloud does not accept the subdomain '{subdomain}': use up to {RavenDBCloudDeployment.MaxSubdomainLength} " +
+                "letters, digits and dashes, not starting or ending with a dash.",
+                nameof(configure));
+        }
+
         var deployment = new RavenDBCloudDeployment(
             builder.Resource,
             apiKey.Resource,

@@ -37,7 +37,7 @@ builder.AddProject<Projects.MyService>("api")
 
 `aspire deploy` then:
 
-1. looks the product up by name (`<resource>-<environment>` unless `ProductName` is set) and creates it when it does not exist, picking the smallest instance type of the tier, the smallest disk and the default release channel unless they are set;
+1. looks the product up by name (`<resource>-<environment>` unless `ProductName` is set) and creates it when it does not exist, picking the smallest instance type of the tier, the smallest disk and the default release channel unless they are set. The node URLs get the subdomain `Subdomain`, derived from the name when unset (up to 13 letters, digits and dashes, unique in the account);
 2. waits until the product is active;
 3. creates the databases declared with `ensureCreated: true`;
 4. issues a client certificate to each application that references the server or one of its databases (see below);

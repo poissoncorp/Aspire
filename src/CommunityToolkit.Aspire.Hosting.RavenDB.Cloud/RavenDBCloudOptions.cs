@@ -52,6 +52,13 @@ public sealed class RavenDBCloudOptions
     /// </summary>
     public string? ProductName { get; set; }
 
+    /// <summary>
+    /// Subdomain of the product's node URLs, which RavenDB Cloud requires to create a paid product: up to 13 letters,
+    /// digits and dashes, not starting or ending with a dash, and unique in the account. When unset, it is derived
+    /// from <see cref="ProductName"/>, shortened with a hash of the name when the name is too long.
+    /// </summary>
+    public string? Subdomain { get; set; }
+
     /// <summary>Cloud provider. Default: <see cref="RavenDBCloudProvider.Aws"/>.</summary>
     public RavenDBCloudProvider Provider { get; set; } = RavenDBCloudProvider.Aws;
 
