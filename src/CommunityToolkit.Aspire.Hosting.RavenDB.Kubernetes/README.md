@@ -19,6 +19,8 @@ kubectl create secret generic ravendb-ca --from-file=ca.crt=./ca.crt
 
 The server certificate covers every node (`*.<domain>`), the admin certificate is a client certificate the operator trusts, and the certificate authority is only needed when it is not publicly trusted.
 
+The operator reads the `.pfx` files with SHA-1 and 3DES only, which is not what OpenSSL 3 writes by default. Export them with `openssl pkcs12 -export -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1 ...`; otherwise the operator reports `pkcs12: unknown digest algorithm` and does not start the nodes.
+
 ### Install the package
 
 In your AppHost project, install the library with [NuGet](https://www.nuget.org):
@@ -56,11 +58,13 @@ The chart then contains, next to the application:
 
 `aspire deploy` installs the chart and waits for the bootstrap Job to complete. The operator only runs pinned images, so set `Image` (or `WithImageTag(...)`) to a concrete tag. It runs one cluster per namespace.
 
+Helm waits for the whole chart, the `RavenDBCluster` included, for five minutes; Aspire does not offer a longer timeout. When the operator puts the cluster in its Error phase, or a bootstrap attempt fails, the deployment logs the reasons right away instead of leaving you with Helm's timeout. A cluster that is still starting when Helm gives up keeps starting: run `aspire deploy` again.
+
 To let the operator obtain the certificates from Let's Encrypt instead, use `cluster.WithLetsEncrypt("ops@example.com", "ravendb-admin")` with a public domain.
 
 ### Client certificates
 
-Each application gets a certificate with `ValidUser` clearance and read/write access to the databases it references and to nothing else: `WithReference(db)` grants that database, `WithReference(server)` grants every database declared on the server. The bootstrap generates the key inside the cluster, registers the certificate with RavenDB and stores it in the Secret `<server>-<application>-client-certificate`, which the application mounts. The [RavenDB client integration](https://www.nuget.org/packages/CommunityToolkit.Aspire.RavenDB.Client) finds it through `Aspire__RavenDB__Client__<connection name>__CertificatePath`, so no application code is needed:
+Each application gets a certificate with `ValidUser` clearance and read/write access to the databases it references and to nothing else: `WithReference(db)` grants that database, `WithReference(server)` grants every database declared on the server. The bootstrap generates the key inside the cluster, registers the certificate with RavenDB as `aspire.<namespace>.<secret>` and stores it in the Secret `<server>-<application>-client-certificate`, which the application mounts. The [RavenDB client integration](https://www.nuget.org/packages/CommunityToolkit.Aspire.RavenDB.Client) finds it through `Aspire__RavenDB__Client__<connection name>__CertificatePath`, so no application code is needed:
 
 ```csharp
 builder.AddRavenDBClient("mydb");
@@ -85,6 +89,10 @@ var db = builder.AddRavenDB("ravendb")
 ### Destroy
 
 `aspire destroy` uninstalls the chart. The operator removes the cluster; the data volumes stay, as with every StatefulSet, and certificates registered in an existing server stay registered.
+
+The RavenDB operator (2.0.0) cannot start a cluster again on the volumes of a removed one: its initialization Job fails on nodes that already form a cluster, and the cluster stays in its Error phase. Delete its volumes, `ravendb-data-ravendb-<tag>-0`, before deploying again; this deletes the data.
+
+`aspire destroy` only knows about deployments that completed: after a first `aspire deploy` that failed, uninstall the release with `helm uninstall`.
 
 ## Feedback & contributing
 

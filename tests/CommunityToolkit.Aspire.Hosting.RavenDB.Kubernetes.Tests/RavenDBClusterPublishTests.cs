@@ -186,6 +186,10 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
     [Fact]
     public async Task BootstrapJobGetsANewNameWhenItsConfigurationChanges()
     {
+        // Published into the same directory, as aspire deploy does: Aspire keeps the files of earlier publishes, and
+        // the chart must still hold a single Job.
+        var directory = Directory.CreateTempSubdirectory(".ravendb-cluster-publish-test");
+
         async Task<string?> JobName(params string[] databases)
         {
             using var chart = await Publish(builder =>
@@ -195,15 +199,23 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
                 {
                     server.AddDatabase(database, ensureCreated: true);
                 }
-            });
+            }, into: directory);
 
+            Assert.Empty(chart.Errors);
             return chart.Single("Job").Scalar("metadata", "name");
         }
 
-        var first = await JobName("orders");
+        try
+        {
+            var first = await JobName("orders");
 
-        Assert.Equal(first, await JobName("orders"));
-        Assert.NotEqual(first, await JobName("orders", "reports"));
+            Assert.Equal(first, await JobName("orders"));
+            Assert.NotEqual(first, await JobName("orders", "reports"));
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
     }
 
     [Fact]
@@ -298,25 +310,37 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void DeployWaitsForTheBootstrapAfterHelm()
+    public void StepsRunAfterTheChartIsWrittenAndAfterHelm()
     {
         using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
         builder.AddKubernetesEnvironment("k8s");
         var server = builder.AddRavenDB("ravendb");
         var deployment = RavenDBClusterDeployment.ForCluster(server.Resource, Options());
 
-        var wait = RavenDBClusterPipelineSteps.Create(deployment);
+        var steps = RavenDBClusterPipelineSteps.Create(deployment).ToList();
+        var publish = Assert.Single(steps, s => s.Name == "ravendb-cluster-publish-ravendb");
+        var watch = Assert.Single(steps, s => s.Name == "ravendb-cluster-watch-ravendb");
+        var wait = Assert.Single(steps, s => s.Name == "ravendb-cluster-wait-ravendb");
+        var writeChart = new PipelineStep { Name = "publish-k8s", Action = _ => Task.CompletedTask };
+        var prepareHelm = new PipelineStep { Name = "prepare-k8s", Action = _ => Task.CompletedTask };
         var helm = new PipelineStep { Name = "helm-deploy-k8s", Action = _ => Task.CompletedTask };
 
         using var services = new ServiceCollection().BuildServiceProvider();
         RavenDBClusterPipelineSteps.Configure(deployment, new PipelineConfigurationContext
         {
             Services = services,
-            Steps = [wait, helm],
+            Steps = [.. steps, writeChart, prepareHelm, helm],
             Model = new DistributedApplicationModel(builder.Resources),
         });
 
-        Assert.Equal("ravendb-cluster-wait-ravendb", wait.Name);
+        Assert.Contains("publish-k8s", publish.DependsOnSteps);
+        Assert.Contains(WellKnownPipelineSteps.Publish, publish.RequiredBySteps);
+
+        // Next to Helm, so a cluster that does not get ready is reported before Helm times out.
+        Assert.Contains("prepare-k8s", watch.DependsOnSteps);
+        Assert.DoesNotContain("helm-deploy-k8s", watch.DependsOnSteps);
+        Assert.Contains(WellKnownPipelineSteps.Deploy, watch.RequiredBySteps);
+
         Assert.Contains("helm-deploy-k8s", wait.DependsOnSteps);
         Assert.Contains(WellKnownPipelineSteps.Deploy, wait.RequiredBySteps);
     }
@@ -356,9 +380,12 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         return options;
     }
 
-    private async Task<PublishedChart> Publish(Action<IDistributedApplicationTestingBuilder> configure, bool addEnvironment = true)
+    private async Task<PublishedChart> Publish(
+        Action<IDistributedApplicationTestingBuilder> configure,
+        bool addEnvironment = true,
+        DirectoryInfo? into = null)
     {
-        var directory = Directory.CreateTempSubdirectory(".ravendb-cluster-publish-test");
+        var directory = into ?? Directory.CreateTempSubdirectory(".ravendb-cluster-publish-test");
         var errors = new List<string>();
 
         using var builder = TestDistributedApplicationBuilder.Create(
@@ -384,10 +411,10 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
             errors.Add(exception.Message);
         }
 
-        return new PublishedChart(directory, errors);
+        return new PublishedChart(directory, errors, ownsDirectory: into is null);
     }
 
-    private sealed class PublishedChart(DirectoryInfo directory, List<string> errors) : IDisposable
+    private sealed class PublishedChart(DirectoryInfo directory, List<string> errors, bool ownsDirectory) : IDisposable
     {
         public string Path => directory.FullName;
 
@@ -415,7 +442,13 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
             return yaml.Documents[0].RootNode.Get(path);
         }
 
-        public void Dispose() => directory.Delete(recursive: true);
+        public void Dispose()
+        {
+            if (ownsDirectory)
+            {
+                directory.Delete(recursive: true);
+            }
+        }
 
         private IEnumerable<YamlMappingNode> Documents()
         {

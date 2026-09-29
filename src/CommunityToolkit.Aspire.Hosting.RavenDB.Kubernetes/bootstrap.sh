@@ -114,6 +114,9 @@ issue_application_certificate() {
     local permissions
     permissions=$(permissions_json "$databases")
 
+    # Named after the namespace as well: a shared server tells the applications of several deployments apart.
+    local name="aspire.$NAMESPACE.$secret"
+
     local status
     status=$("${KUBE[@]}" -o "$WORK/secret.json" -w '%{http_code}' "$KUBERNETES_API/api/v1/namespaces/$NAMESPACE/secrets/$secret")
 
@@ -137,13 +140,13 @@ issue_application_certificate() {
 
     if [[ "$status" == "200" ]]; then
         status=$("${RAVEN[@]}" -o "$WORK/response" -w '%{http_code}' -X POST -H "Content-Type: application/json" \
-            -d "{\"Thumbprint\":\"$thumbprint\",\"Name\":\"$secret\",\"SecurityClearance\":\"ValidUser\",\"Disabled\":false,\"Permissions\":$permissions}" \
+            -d "{\"Thumbprint\":\"$thumbprint\",\"Name\":\"$name\",\"SecurityClearance\":\"ValidUser\",\"Disabled\":false,\"Permissions\":$permissions}" \
             "$LEADER/admin/certificates/edit")
     else
         local certificate
         certificate=$(openssl x509 -in "$WORK/$secret.crt" -outform DER | base64 -w 0)
         status=$("${RAVEN[@]}" -o "$WORK/response" -w '%{http_code}' -X PUT -H "Content-Type: application/json" \
-            -d "{\"Name\":\"$secret\",\"Certificate\":\"$certificate\",\"SecurityClearance\":\"ValidUser\",\"Permissions\":$permissions}" \
+            -d "{\"Name\":\"$name\",\"Certificate\":\"$certificate\",\"SecurityClearance\":\"ValidUser\",\"Permissions\":$permissions}" \
             "$LEADER/admin/certificates")
     fi
 
