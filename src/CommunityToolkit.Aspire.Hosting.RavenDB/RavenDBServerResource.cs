@@ -131,6 +131,12 @@ public class RavenDBServerResource(string name, bool isSecured) : ContainerResou
     internal bool HasLiteralLicense { get; set; }
 
     /// <summary>
+    /// The parameter given to <c>WithLicense(parameter)</c>, for strategies that deliver the license another way
+    /// than through the container's environment.
+    /// </summary>
+    internal ParameterResource? LicenseParameter { get; set; }
+
+    /// <summary>
     /// Adds a database to the resource.
     /// </summary>
     /// <param name="name">The name of the resource to associate with the database.</param>

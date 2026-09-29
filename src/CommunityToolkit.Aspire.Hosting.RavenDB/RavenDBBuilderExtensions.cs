@@ -401,6 +401,7 @@ public static class RavenDBBuilderExtensions
         ArgumentNullException.ThrowIfNull(license);
 
         builder.Resource.HasLiteralLicense = false;
+        builder.Resource.LicenseParameter = license.Resource;
 
         return builder
             .WithEnvironment("RAVEN_License", license)

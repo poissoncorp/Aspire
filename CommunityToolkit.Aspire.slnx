@@ -291,6 +291,7 @@
     <Project Path="src/CommunityToolkit.Aspire.Hosting.Python.Extensions/CommunityToolkit.Aspire.Hosting.Python.Extensions.csproj" />
     <Project Path="src/CommunityToolkit.Aspire.Hosting.RavenDB/CommunityToolkit.Aspire.Hosting.RavenDB.csproj" />
     <Project Path="src/CommunityToolkit.Aspire.Hosting.RavenDB.Cloud/CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.csproj" />
+    <Project Path="src/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes.csproj" />
     <Project Path="src/CommunityToolkit.Aspire.Hosting.Redis.Extensions/CommunityToolkit.Aspire.Hosting.Redis.Extensions.csproj" />
     <Project Path="src/CommunityToolkit.Aspire.Hosting.RedPanda/CommunityToolkit.Aspire.Hosting.RedPanda.csproj" />
     <Project Path="src/CommunityToolkit.Aspire.Hosting.Rust/CommunityToolkit.Aspire.Hosting.Rust.csproj" />
@@ -370,6 +371,7 @@
     <Project Path="tests/CommunityToolkit.Aspire.Hosting.PowerShell.Tests/CommunityToolkit.Aspire.Hosting.PowerShell.Tests.csproj" />
     <Project Path="tests/CommunityToolkit.Aspire.Hosting.RavenDB.Tests/CommunityToolkit.Aspire.Hosting.RavenDB.Tests.csproj" />
     <Project Path="tests/CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.Tests/CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.Tests.csproj" />
+    <Project Path="tests/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes.Tests/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes.Tests.csproj" />
     <Project Path="tests/CommunityToolkit.Aspire.Hosting.Redis.Extensions.Tests/CommunityToolkit.Aspire.Hosting.Redis.Extensions.Tests.csproj" />
     <Project Path="tests/CommunityToolkit.Aspire.Hosting.RedPanda.Tests/CommunityToolkit.Aspire.Hosting.RedPanda.Tests.csproj" />
     <Project Path="tests/CommunityToolkit.Aspire.Hosting.Rust.Tests/CommunityToolkit.Aspire.Hosting.Rust.Tests.csproj" />

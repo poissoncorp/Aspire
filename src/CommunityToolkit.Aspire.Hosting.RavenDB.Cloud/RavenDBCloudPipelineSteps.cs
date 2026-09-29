@@ -225,7 +225,7 @@ internal static class RavenDBCloudPipelineSteps
         var environmentName = hostEnvironment?.EnvironmentName ?? "Production";
         var requests = new List<ClientCertificateRequest>();
 
-        foreach (var consumer in RavenDBCloudClientCertificates.FindConsumers(context.Model, server))
+        foreach (var consumer in RavenDBConsumers.Find(context.Model, server))
         {
             var target = consumer.Resource.Annotations.OfType<DeploymentTargetAnnotation>().FirstOrDefault()?.ComputeEnvironment;
 

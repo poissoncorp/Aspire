@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Deploys the Aspire RavenDB integration to Kubernetes through the RavenDB operator: aspire publish emits a RavenDBCluster and a bootstrap job that creates the databases and a client certificate per application.</Description>
+    <AdditionalPackageTags>hosting ravendb kubernetes operator deployment</AdditionalPackageTags>
+    <!-- Built on Aspire's Kubernetes publisher and pipeline APIs, which are still in preview. -->
+    <IsPreview>true</IsPreview>
+    <NoWarn>$(NoWarn);ASPIREPIPELINES001;ASPIREPIPELINES002;ASPIREPIPELINES004</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting" />
+    <PackageReference Include="Aspire.Hosting.Kubernetes" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CommunityToolkit.Aspire.Hosting.RavenDB\CommunityToolkit.Aspire.Hosting.RavenDB.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="bootstrap.sh" LogicalName="CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes.bootstrap.sh" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes.Tests" />
+  </ItemGroup>
+
+</Project>

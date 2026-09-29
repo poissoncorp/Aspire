@@ -3,6 +3,7 @@
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Docker;
 using Aspire.Hosting.Pipelines;
+using CommunityToolkit.Aspire.Hosting.RavenDB;
 using CommunityToolkit.Aspire.Hosting.RavenDB.Cloud;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -71,7 +72,7 @@ public static class RavenDBCloudBuilderExtensions
         // it; the deploy step issues it and writes it next to the compose file.
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((@event, _) =>
         {
-            var consumers = RavenDBCloudClientCertificates.FindConsumers(@event.Model, builder.Resource);
+            var consumers = RavenDBConsumers.Find(@event.Model, builder.Resource);
 
             if (consumers.Count > 0)
             {

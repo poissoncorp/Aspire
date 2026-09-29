@@ -1,0 +1,91 @@
+# CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes library
+
+Deploys the [RavenDB hosting integration](https://www.nuget.org/packages/CommunityToolkit.Aspire.Hosting.RavenDB) to Kubernetes through the [RavenDB operator](https://github.com/ravendb/ravendb-operator). `aspire run` keeps the local RavenDB container; `aspire publish` and `aspire deploy` put a `RavenDBCluster` into the Helm chart and let the operator run it.
+
+## Getting started
+
+### Prerequisites
+
+- The RavenDB operator installed in the cluster.
+- An ingress controller the operator can publish the nodes through (`nginx`, `traefik` or `haproxy`).
+- DNS for the nodes, inside the cluster as well: node `a` is `https://a.<domain>:443`, and the operator's own bootstrap and the applications connect through those names.
+- Secrets in the target namespace, created the way the operator documents them:
+
+```bash
+kubectl create secret generic ravendb-server --from-file=server.pfx=./server.pfx
+kubectl create secret generic ravendb-admin --from-file=client.pfx=./admin.pfx
+kubectl create secret generic ravendb-ca --from-file=ca.crt=./ca.crt
+```
+
+The server certificate covers every node (`*.<domain>`), the admin certificate is a client certificate the operator trusts, and the certificate authority is only needed when it is not publicly trusted.
+
+### Install the package
+
+In your AppHost project, install the library with [NuGet](https://www.nuget.org):
+
+```dotnetcli
+dotnet add package CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes
+```
+
+## Usage example
+
+```csharp
+builder.AddKubernetesEnvironment("k8s");
+
+var license = builder.AddParameter("ravendb-license", secret: true);
+
+var db = builder.AddRavenDB("ravendb")
+    .WithLicense(license)
+    .PublishAsRavenDBCluster(cluster =>
+    {
+        cluster.Domain = "ravendb.example.com";
+        cluster.Nodes = 3;
+        cluster.Image = "ravendb/ravendb:7.2.6-ubuntu.24.04-x64";
+        cluster.WithCertificates("ravendb-server", "ravendb-admin", "ravendb-ca");
+    })
+    .AddDatabase("mydb", ensureCreated: true);
+
+builder.AddProject<Projects.MyService>("api")
+    .WithReference(db);
+```
+
+The chart then contains, next to the application:
+
+- the `RavenDBCluster` the operator reconciles, and a Secret with the license;
+- a bootstrap Job, with a ServiceAccount and a Role limited to the applications' Secrets, that waits until every node has joined, creates the databases declared with `ensureCreated: true`, and gives every application a client certificate of its own.
+
+`aspire deploy` installs the chart and waits for the bootstrap Job to complete. The operator only runs pinned images, so set `Image` (or `WithImageTag(...)`) to a concrete tag. It runs one cluster per namespace.
+
+To let the operator obtain the certificates from Let's Encrypt instead, use `cluster.WithLetsEncrypt("ops@example.com", "ravendb-admin")` with a public domain.
+
+### Client certificates
+
+Each application gets a certificate with `ValidUser` clearance and read/write access to the databases it references and to nothing else: `WithReference(db)` grants that database, `WithReference(server)` grants every database declared on the server. The bootstrap generates the key inside the cluster, registers the certificate with RavenDB and stores it in the Secret `<server>-<application>-client-certificate`, which the application mounts. The [RavenDB client integration](https://www.nuget.org/packages/CommunityToolkit.Aspire.RavenDB.Client) finds it through `Aspire__RavenDB__Client__<connection name>__CertificatePath`, so no application code is needed:
+
+```csharp
+builder.AddRavenDBClient("mydb");
+```
+
+With a certificate authority of its own, the application trusts it through `SSL_CERT_DIR`, next to the image's own trusted roots. The applications never get the admin certificate.
+
+The Job runs again whenever its configuration changes. It keeps existing certificates, updates their access, and registers them again if they were removed from RavenDB. The Secrets belong to the chart's ServiceAccount, so uninstalling the chart removes them.
+
+### An existing server
+
+For a RavenDB server that runs outside the application, typically a cluster the operator runs for several applications, the chart only gets the bootstrap Job and the applications' certificates. No database is created:
+
+```csharp
+var url = builder.AddParameter("ravendb-url"); // https://a.ravendb.example.com:443
+
+var db = builder.AddRavenDB("ravendb")
+    .PublishAsExistingRavenDBCluster(url, "ravendb-admin", "ravendb-ca")
+    .AddDatabase("mydb");
+```
+
+### Destroy
+
+`aspire destroy` uninstalls the chart. The operator removes the cluster; the data volumes stay, as with every StatefulSet, and certificates registered in an existing server stay registered.
+
+## Feedback & contributing
+
+https://github.com/CommunityToolkit/Aspire

@@ -70,8 +70,8 @@ public class RavenDBCloudPublishTests
         builder.AddContainer("worker", "busybox").WithReference(server);
         builder.AddContainer("unrelated", "busybox").WithReference(other);
 
-        var consumers = RavenDBCloudClientCertificates
-            .FindConsumers(new DistributedApplicationModel(builder.Resources), server.Resource)
+        var consumers = RavenDBConsumers
+            .Find(new DistributedApplicationModel(builder.Resources), server.Resource)
             .ToDictionary(c => c.Resource.Name);
 
         Assert.Equal(["api", "worker"], consumers.Keys.Order());
