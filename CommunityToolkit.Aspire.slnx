@@ -175,6 +175,8 @@
     <Project Path="examples/ravendb/CommunityToolkit.Aspire.Hosting.RavenDB.ApiService/CommunityToolkit.Aspire.Hosting.RavenDB.ApiService.csproj" />
     <Project Path="examples/ravendb/CommunityToolkit.Aspire.Hosting.RavenDB.ServiceDefaults/CommunityToolkit.Aspire.Hosting.RavenDB.ServiceDefaults.csproj" />
     <Project Path="examples/ravendb/RavenDB.AppHost/CommunityToolkit.Aspire.Hosting.RavenDB.AppHost.csproj" />
+    <Project Path="examples/ravendb/RavenDB.Cloud.AppHost/CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.AppHost.csproj" />
+    <Project Path="examples/ravendb/RavenDB.Kubernetes.AppHost/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes.AppHost.csproj" />
   </Folder>
   <Folder Name="/examples/redis-ext/">
     <Project Path="examples/redis-ext/CommunityToolkit.Aspire.Hosting.Redis.Extensions.AppHost/CommunityToolkit.Aspire.Hosting.Redis.Extensions.AppHost.csproj" />
