@@ -37,7 +37,7 @@ With a Docker Compose environment in the AppHost, the published `docker-compose.
 
 - an HTTP health check on the RavenDB service (`/build/version`) for unsecured servers;
 - `condition: service_healthy` for every resource that waits for the server;
-- a one-shot `<name>-bootstrap` service that creates the databases added with `ensureCreated: true`, the same databases the AppHost creates locally. Running it again leaves existing databases untouched.
+- a one-shot `<name>-bootstrap` service that creates the databases added with `ensureCreated: true`, the same databases the AppHost creates locally. Running it again leaves existing databases untouched. The applications that use the server start once it has completed; a database it cannot create fails it, and with it those applications.
 
 ```csharp
 builder.AddDockerComposeEnvironment("compose");
@@ -49,6 +49,8 @@ var db = builder.AddRavenDB("ravendb")
     .WithLicense(license)
     .AddDatabase("mydb", ensureCreated: true);
 ```
+
+`aspire destroy` only knows about deployments that completed: Aspire records the Compose project once `docker compose up` succeeds. After a first `aspire deploy` that failed, for example on a database that could not be created, stop the containers yourself. `docker compose ls` lists the project (`aspire-compose-<hash>` for an environment named `compose`), and `docker compose --project-name <project> down` stops it.
 
 ### License
 
