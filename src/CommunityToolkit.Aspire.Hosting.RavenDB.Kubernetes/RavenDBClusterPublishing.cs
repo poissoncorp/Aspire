@@ -75,6 +75,12 @@ internal static partial class RavenDBClusterPublishing
         {
             Validate(@event.Model, deployment);
 
+            // Next to other compute environments, Aspire needs to know where the server and its bootstrap go. The
+            // operator runs the server: the Kubernetes environment deploys nothing for it.
+            var environment = applicationBuilder.CreateResourceBuilder<IComputeEnvironmentResource>(TargetEnvironment(@event.Model, server));
+            applicationBuilder.CreateResourceBuilder(server).WithComputeEnvironment(environment);
+            bootstrap.WithComputeEnvironment(environment);
+
             // An application that brings its own certificate gets it from WithRavenDBClientCertificateSecret.
             deployment.Consumers = RavenDBConsumers.Find(@event.Model, server)
                 .Where(c => !c.BringsOwnCertificate && !ReferenceEquals(c.Resource, bootstrap.Resource))
@@ -146,6 +152,52 @@ internal static partial class RavenDBClusterPublishing
                 $"The RavenDB operator reads the license of '{server.Name}' from a Secret. Pass the license as a " +
                 "parameter with WithLicense(...), or name an existing Secret with LicenseSecretName.");
         }
+
+        // The bootstrap script and its settings take the names as they are.
+        foreach (var database in server.Databases.Values)
+        {
+            RavenDBPublishing.EnsureValidDatabaseName(database);
+        }
+
+        RavenDBClientCertificates.EnsureMountable(
+            RavenDBConsumers.Find(model, server), server, RavenDBClientCertificateSource.KubernetesSecret);
+        EnsureApplicationSecretsAreTheirOwn(model, deployment);
+    }
+
+    /// <summary>
+    /// An application's Secret must not be one the cluster itself uses: the application would mount the admin
+    /// certificate or the license, and the bootstrap would register an admin certificate as the application's.
+    /// </summary>
+    private static void EnsureApplicationSecretsAreTheirOwn(DistributedApplicationModel model, RavenDBClusterDeployment deployment)
+    {
+        string?[] clusterSecrets =
+            [deployment.ClientCertificateSecret, deployment.Options.ServerCertificateSecret, deployment.CertificateAuthoritySecret, deployment.LicenseSecretName];
+
+        foreach (var consumer in RavenDBConsumers.Find(model, deployment.Server).Where(c => c.Resource.Name != deployment.BootstrapName))
+        {
+            var secret = consumer.BringsOwnCertificate
+                ? consumer.OwnCertificate(RavenDBClientCertificateSource.KubernetesSecret)?.Location
+                : deployment.ApplicationSecretName(consumer.Resource);
+
+            if (secret is not null && clusterSecrets.Contains(secret))
+            {
+                throw new DistributedApplicationException(
+                    $"'{consumer.Resource.Name}' would get Secret '{secret}', which RavenDB cluster '{deployment.Server.Name}' " +
+                    "uses for its own certificates or license. Give the application a certificate Secret of its own.");
+            }
+        }
+    }
+
+    /// <summary>The Kubernetes environment the cluster runs in; other kinds of compute environments may sit next to it.</summary>
+    private static KubernetesEnvironmentResource TargetEnvironment(DistributedApplicationModel model, RavenDBServerResource server)
+    {
+        var environments = model.Resources.OfType<KubernetesEnvironmentResource>().ToList();
+
+        return environments.Count == 1
+            ? environments[0]
+            : throw new DistributedApplicationException(
+                $"RavenDB server '{server.Name}' is published as a RavenDB cluster, which needs exactly one Kubernetes " +
+                $"environment, and the application has {environments.Count}.");
     }
 
     private static (string Image, string Tag) ResolveImage(RavenDBClusterDeployment deployment)
@@ -190,6 +242,17 @@ internal static partial class RavenDBClusterPublishing
         pod.RestartPolicy = "OnFailure";
         pod.ServiceAccountName = deployment.BootstrapName;
 
+        // The image's own user (ravendb, 999), nothing more. The script keeps the keys it handles in /tmp, which
+        // lives in memory rather than on the node's disk.
+        pod.SecurityContext = new PodSecurityContextV1
+        {
+            RunAsNonRoot = true,
+            RunAsUser = 999,
+            RunAsGroup = 999,
+            SeccompProfile = new SeccompProfileV1 { Type = "RuntimeDefault" },
+        };
+        pod.Volumes.Add(new VolumeV1 { Name = "scratch", EmptyDir = new EmptyDirVolumeSourceV1 { Medium = "Memory" } });
+
         pod.Volumes.Add(new VolumeV1
         {
             Name = "bootstrap-script",
@@ -198,16 +261,23 @@ internal static partial class RavenDBClusterPublishing
         pod.Volumes.Add(new VolumeV1
         {
             Name = "admin-certificate",
-            Secret = new SecretVolumeSourceV1 { SecretName = deployment.ClientCertificateSecret },
+            Secret = RavenDBKubernetesCertificates.SecretFile(deployment.ClientCertificateSecret, "client.pfx"),
         });
 
         var container = pod.Containers.Single();
+        container.SecurityContext = new SecurityContextV1
+        {
+            AllowPrivilegeEscalation = false,
+            ReadOnlyRootFilesystem = true,
+            Capabilities = new CapabilitiesV1 { Drop = { "ALL" } },
+        };
+        container.VolumeMounts.Add(new VolumeMountV1 { Name = "scratch", MountPath = "/tmp" });
         container.VolumeMounts.Add(new VolumeMountV1 { Name = "bootstrap-script", MountPath = Path.GetDirectoryName(ScriptPath)!.Replace('\\', '/'), ReadOnly = true });
         container.VolumeMounts.Add(new VolumeMountV1 { Name = "admin-certificate", MountPath = "/ravendb/admin", ReadOnly = true });
 
         if (deployment.CertificateAuthoritySecret is { } certificateAuthority)
         {
-            pod.Volumes.Add(new VolumeV1 { Name = "certificate-authority", Secret = new SecretVolumeSourceV1 { SecretName = certificateAuthority } });
+            pod.Volumes.Add(new VolumeV1 { Name = "certificate-authority", Secret = RavenDBKubernetesCertificates.SecretFile(certificateAuthority, "ca.crt") });
             container.VolumeMounts.Add(new VolumeMountV1 { Name = "certificate-authority", MountPath = "/ravendb/ca", ReadOnly = true });
         }
 
@@ -232,7 +302,7 @@ internal static partial class RavenDBClusterPublishing
         k8s.AdditionalResources.AddRange(CreateAccess(deployment));
         k8s.AdditionalResources.Add(CreateCluster(deployment));
 
-        if (string.Equals(deployment.Options.IngressClassName, "traefik", StringComparison.OrdinalIgnoreCase))
+        if (deployment.Options.IngressClassName == "traefik")
         {
             k8s.AdditionalResources.Add(CreateTraefikRoutes(deployment));
         }

@@ -1,3 +1,4 @@
+using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Docker.Resources;
 using Aspire.Hosting.Docker.Resources.ComposeNodes;
@@ -29,6 +30,42 @@ internal sealed record RavenDBClientCertificateAnnotation(
     string Location,
     string? CertificateAuthority = null) : IResourceAnnotation;
 
+internal static class RavenDBClientCertificates
+{
+    /// <summary>
+    /// One certificate serves every connection of an application to a server: a second one of the same kind would
+    /// be mounted twice, or replace the first.
+    /// </summary>
+    public static RavenDBClientCertificateAnnotation Single(IResource application, RavenDBClientCertificateAnnotation certificate)
+    {
+        if (application.Annotations.OfType<RavenDBClientCertificateAnnotation>()
+            .Any(c => ReferenceEquals(c.Server, certificate.Server) && c.Source == certificate.Source))
+        {
+            throw new InvalidOperationException(
+                $"'{application.Name}' already has a client certificate for RavenDB server '{certificate.Server.Name}'. " +
+                "One certificate serves every connection of the application to that server.");
+        }
+
+        return certificate;
+    }
+
+    /// <summary>
+    /// A brought certificate reaches the application only where its kind is mounted: a file in Docker Compose, a
+    /// Secret in Kubernetes. Brought in the other kind, the application would start without one.
+    /// </summary>
+    public static void EnsureMountable(IEnumerable<RavenDBConsumer> consumers, RavenDBServerResource server, RavenDBClientCertificateSource mounted)
+    {
+        foreach (var consumer in consumers.Where(c => c.BringsOwnCertificate && c.OwnCertificate(mounted) is null))
+        {
+            throw new DistributedApplicationException(mounted == RavenDBClientCertificateSource.File
+                ? $"'{consumer.Resource.Name}' brings its certificate for RavenDB server '{server.Name}' as a Kubernetes Secret, " +
+                  "which only Kubernetes mounts. With Docker Compose, use WithRavenDBClientCertificateFile."
+                : $"'{consumer.Resource.Name}' brings its certificate for RavenDB server '{server.Name}' as a file, which only " +
+                  "Docker Compose mounts. In Kubernetes, use WithRavenDBClientCertificateSecret.");
+        }
+    }
+}
+
 /// <summary>
 /// How an application gets its client certificate in Docker Compose: a secret mounted as a file, and the setting the
 /// RavenDB client integration reads the file path from. Used for issued and for brought certificates alike.
@@ -50,7 +87,8 @@ internal static class RavenDBComposeCertificates
             return;
         }
 
-        var secret = $"ravendb-{server.Name}-{consumer.Resource.Name}-certificate".ToLowerInvariant();
+        // Resource names never contain "--", so it tells the server's name from the application's.
+        var secret = $"ravendb-{server.Name}--{consumer.Resource.Name}-certificate".ToLowerInvariant();
         var target = $"ravendb-{server.Name}.pfx".ToLowerInvariant();
 
         file.Secrets[secret] = new Secret { File = certificateFile };

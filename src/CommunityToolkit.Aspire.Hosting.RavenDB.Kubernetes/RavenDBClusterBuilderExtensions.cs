@@ -1,5 +1,6 @@
 #pragma warning disable ASPIREATS001 // AspireExport is experimental
 
+using System.Text.RegularExpressions;
 using Aspire.Hosting.ApplicationModel;
 using CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes;
 
@@ -8,7 +9,7 @@ namespace Aspire.Hosting;
 /// <summary>
 /// Publishes a RavenDB server to Kubernetes through the RavenDB operator.
 /// </summary>
-public static class RavenDBClusterBuilderExtensions
+public static partial class RavenDBClusterBuilderExtensions
 {
     /// <summary>
     /// Publishes the server as a cluster the RavenDB operator runs: the Helm chart gets a <c>RavenDBCluster</c> and a
@@ -46,9 +47,27 @@ public static class RavenDBClusterBuilderExtensions
             throw new ArgumentException("A RavenDB cluster needs a Domain: node a is published at https://a.<domain>.", nameof(configure));
         }
 
-        if (options.Nodes < 1)
+        // The domain ends up in the node URLs, the certificates and the ingress routes.
+        if (!DomainPattern().IsMatch(options.Domain))
         {
-            throw new ArgumentException("A RavenDB cluster needs at least one node.", nameof(configure));
+            throw new ArgumentException(
+                $"'{options.Domain}' is not a domain the nodes can be published under: use lowercase letters, digits, " +
+                "dashes and dots, as in ravendb.example.com.",
+                nameof(configure));
+        }
+
+        // Node tags are the letters a to z.
+        if (options.Nodes is < 1 or > 26)
+        {
+            throw new ArgumentException("A RavenDB cluster has 1 to 26 nodes.", nameof(configure));
+        }
+
+        // The operator's RavenDBCluster definition accepts these three only.
+        if (options.IngressClassName is not ("nginx" or "traefik" or "haproxy"))
+        {
+            throw new ArgumentException(
+                $"The RavenDB operator publishes the nodes through nginx, traefik or haproxy, not '{options.IngressClassName}'.",
+                nameof(configure));
         }
 
         if (options.Mode is null)
@@ -66,4 +85,8 @@ public static class RavenDBClusterBuilderExtensions
         RavenDBClusterPublishing.Configure(builder, new RavenDBClusterDeployment(builder.Resource, options));
         return builder;
     }
+
+    // DNS labels of lowercase letters, digits and inner dashes, separated by dots.
+    [GeneratedRegex(@"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")]
+    private static partial Regex DomainPattern();
 }

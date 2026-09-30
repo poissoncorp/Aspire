@@ -45,7 +45,9 @@ public static class RavenDBKubernetesClientCertificateExtensions
         ArgumentException.ThrowIfNullOrWhiteSpace(secretName);
 
         var server = database.Resource.Parent;
-        builder.WithAnnotation(new RavenDBClientCertificateAnnotation(server, RavenDBClientCertificateSource.KubernetesSecret, secretName, certificateAuthoritySecret));
+        builder.WithAnnotation(RavenDBClientCertificates.Single(
+            builder.Resource,
+            new RavenDBClientCertificateAnnotation(server, RavenDBClientCertificateSource.KubernetesSecret, secretName, certificateAuthoritySecret)));
 
         if (!builder.ApplicationBuilder.ExecutionContext.IsPublishMode)
         {

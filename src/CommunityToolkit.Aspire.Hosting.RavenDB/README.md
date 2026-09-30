@@ -76,6 +76,8 @@ builder.AddProject<Projects.Api>("api")
     .WithRavenDBClientCertificateFile(db, "certs/api.pfx"); // Docker Compose: mounted as a secret
 ```
 
+The file holds the application's private key: keep it out of source control.
+
 In Kubernetes, `WithRavenDBClientCertificateSecret(db, "api-cert", "ravendb-ca")` from [CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes](https://www.nuget.org/packages/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes) mounts an existing Secret instead.
 
 ### Checks at publish time

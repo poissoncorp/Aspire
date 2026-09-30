@@ -36,6 +36,30 @@ public class RavenDBPublishTests(ITestOutputHelper output)
         Assert.Equal("curl -sf http://127.0.0.1:8080/build/version > /dev/null || exit 1", healthCheck.Children[1].ToString());
 
         Assert.Equal("service_healthy", services["consumer"]["depends_on"]["ravendb"]["condition"].ToString());
+
+        // As in run mode, the application starts once its databases exist.
+        Assert.Equal("service_completed_successfully", services["consumer"]["depends_on"]["ravendb-bootstrap"]["condition"].ToString());
+    }
+
+    [Fact]
+    public async Task TwoServersPublishTogether()
+    {
+        using var tempDir = new TempDirectory();
+        using var builder = CreateForPublish(tempDir.Path);
+        var logs = CaptureLogs(builder);
+
+        builder.Configuration["Parameters:reports-url"] = "https://a.reports.example.com";
+        builder.AddDockerComposeEnvironment("compose");
+        var orders = builder.AddRavenDB("orders").AddDatabase("orders-db", ensureCreated: true);
+        var reports = builder.AddRavenDB("reports").PublishAsExisting(builder.AddParameter("reports-url")).AddDatabase("reports-db");
+
+        builder.AddContainer("consumer", "busybox").WithReference(orders).WithReference(reports);
+
+        using var app = builder.Build();
+        await app.RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain(logs.Entries, e => e.Level >= LogLevel.Error);
+        Assert.True(ReadComposeServices(tempDir.Path).Children.ContainsKey(new YamlScalarNode("orders")));
     }
 
     [Fact]
@@ -64,6 +88,9 @@ public class RavenDBPublishTests(ITestOutputHelper output)
         Assert.Contains("http://ravendb:8080/admin/databases?name=orders", script);
         Assert.Contains("http://ravendb:8080/admin/databases?name=catalog-db", script);
         Assert.DoesNotContain("reports", script);
+
+        // A database that could not be created fails the service.
+        Assert.Contains("creating database orders failed' >&2; exit 1", script);
     }
 
     [Fact]
@@ -213,6 +240,7 @@ public class RavenDBPublishTests(ITestOutputHelper output)
     {
         using var tempDir = new TempDirectory();
         using var builder = CreateForPublish(tempDir.Path);
+        var logs = CaptureLogs(builder);
 
         builder.Configuration["Parameters:ravendb-url"] = "https://a.ravendb.example.com";
         builder.AddDockerComposeEnvironment("compose");
@@ -230,13 +258,29 @@ public class RavenDBPublishTests(ITestOutputHelper output)
         yaml.Load(new StringReader(File.ReadAllText(Path.Combine(tempDir.Path, "docker-compose.yaml"))));
         var compose = (YamlMappingNode)yaml.Documents[0].RootNode;
 
-        // Relative to the AppHost, which is not where Docker Compose resolves it.
-        var file = compose["secrets"]["ravendb-ravendb-consumer-certificate"]["file"].ToString();
-        Assert.Equal(Path.GetFullPath("certs/consumer.pfx", builder.AppHostDirectory), file);
+        // Given relative to the AppHost; Docker Compose resolves it relative to the compose file.
+        var file = compose["secrets"]["ravendb-ravendb--consumer-certificate"]["file"].ToString();
+        var certificate = Path.GetFullPath("certs/consumer.pfx", builder.AppHostDirectory);
+        Assert.Equal(Path.GetRelativePath(tempDir.Path, certificate).Replace('\\', '/'), file);
 
         var consumer = (YamlMappingNode)compose["services"]["consumer"];
-        Assert.Equal("ravendb-ravendb-consumer-certificate", consumer["secrets"][0]["source"].ToString());
+        Assert.Equal("ravendb-ravendb--consumer-certificate", consumer["secrets"][0]["source"].ToString());
         Assert.Equal("/run/secrets/ravendb-ravendb.pfx", consumer["environment"]["Aspire__RavenDB__Client__orders__CertificatePath"].ToString());
+
+        // The owner has not handed the file over yet: publishing works, starting would not.
+        Assert.Contains(logs.Entries, e => e.Level == LogLevel.Warning && e.Text.Contains("does not exist yet", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ASecondCertificateForTheSameServerIsRejected()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        var orders = builder.AddRavenDB("ravendb").AddDatabase("orders");
+        var api = builder.AddContainer("api", "busybox").WithRavenDBClientCertificateFile(orders, "certs/api.pfx");
+
+        var exception = Assert.Throws<InvalidOperationException>(() => api.WithRavenDBClientCertificateFile(orders, "certs/other.pfx"));
+
+        Assert.Contains("'api' already has a client certificate for RavenDB server 'ravendb'", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]

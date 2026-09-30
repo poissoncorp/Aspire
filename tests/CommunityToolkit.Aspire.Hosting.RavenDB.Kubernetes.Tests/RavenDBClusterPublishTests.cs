@@ -1,5 +1,6 @@
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
+using Aspire.Hosting.Kubernetes;
 using Aspire.Hosting.Pipelines;
 using Aspire.Hosting.Testing;
 using Aspire.Hosting.Utils;
@@ -78,6 +79,20 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         Assert.Equal("ravendb-admin", volumes["admin-certificate"].Scalar("secret", "secretName"));
         Assert.Equal("ravendb-ca", volumes["certificate-authority"].Scalar("secret", "secretName"));
 
+        // Only the keys the Job needs, and its scratch space (keys included) in memory.
+        Assert.Equal("client.pfx", volumes["admin-certificate"].Items("secret", "items").Single().Scalar("key"));
+        Assert.Equal("ca.crt", volumes["certificate-authority"].Items("secret", "items").Single().Scalar("key"));
+        Assert.Equal("Memory", volumes["scratch"].Scalar("emptyDir", "medium"));
+        Assert.Equal("/tmp", container.Items("volumeMounts").Single(m => m.Scalar("name") == "scratch").Scalar("mountPath"));
+
+        // The image's own non-root user, and nothing more.
+        Assert.Equal("true", pod.Scalar("securityContext", "runAsNonRoot"));
+        Assert.Equal("999", pod.Scalar("securityContext", "runAsUser"));
+        Assert.Equal("RuntimeDefault", pod.Scalar("securityContext", "seccompProfile", "type"));
+        Assert.Equal("false", container.Scalar("securityContext", "allowPrivilegeEscalation"));
+        Assert.Equal("true", container.Scalar("securityContext", "readOnlyRootFilesystem"));
+        Assert.Equal(["ALL"], container.Items("securityContext", "capabilities", "drop").Select(n => ((YamlScalarNode)n).Value));
+
         Assert.Equal(RavenDBClusterPublishing.Script, chart.Single("ConfigMap", "ravendb-bootstrap-script").Scalar("data", "bootstrap.sh"));
 
         var settings = chart.Values("config", "ravendb_bootstrap");
@@ -91,8 +106,7 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
             settings.Scalar("RAVENDB_APPLICATIONS"));
         Assert.Equal("ravendb-bootstrap", settings.Scalar("RAVENDB_SECRET_OWNER"));
 
-        // The license is for the operator; the Job gets none.
-        Assert.Null(chart.Values("secrets", "ravendb_bootstrap").Find("RAVENDB_LICENSE"));
+        // The license is for the operator: the Job gets no secrets at all.
         Assert.DoesNotContain(chart.All("Secret"), s => s.Scalar("metadata", "name") == "ravendb-bootstrap-secrets");
     }
 
@@ -141,6 +155,10 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         Assert.Equal("ravendb-api-client-certificate", volumes["ravendb-client-certificate"].Scalar("secret", "secretName"));
         Assert.Equal("ravendb-ca", volumes["ravendb-certificate-authority"].Scalar("secret", "secretName"));
 
+        // A certificate authority Secret from cert-manager also holds the authority's key: only ca.crt is mounted.
+        Assert.Equal("client.pfx", volumes["ravendb-client-certificate"].Items("secret", "items").Single().Scalar("key"));
+        Assert.Equal("ca.crt", volumes["ravendb-certificate-authority"].Items("secret", "items").Single().Scalar("key"));
+
         var container = pod.Items("containers")[0];
         var mounts = container.Items("volumeMounts").ToDictionary(m => m.Scalar("name")!, m => m.Scalar("mountPath"));
         Assert.Equal("/ravendb/ravendb", mounts["ravendb-client-certificate"]);
@@ -179,6 +197,24 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
                 var service = r.Items("services").Single();
                 return (r.Scalar("match"), service.Scalar("name"), service.Scalar("port"));
             }));
+    }
+
+    [Fact]
+    public async Task ClusterWorksNextToAnotherComputeEnvironment()
+    {
+        using var chart = await Publish(builder =>
+        {
+            var k8s = builder.Resources.OfType<KubernetesEnvironmentResource>().Single();
+            builder.AddDockerComposeEnvironment("compose");
+
+            var orders = AddCluster(builder).AddDatabase("orders");
+            builder.AddContainer("api", "busybox").WithReference(orders).WithComputeEnvironment(builder.CreateResourceBuilder(k8s));
+        }, chartDirectory: "k8s");
+
+        Assert.Empty(chart.Errors);
+        Assert.Single(chart.All("RavenDBCluster"));
+        Assert.Single(chart.All("Job"));
+        Assert.False(Directory.Exists(Path.Combine(chart.Path, "templates", "ravendb")));
     }
 
     [Fact]
@@ -308,6 +344,9 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
     [InlineData("floating-tag", "only runs pinned images")]
     [InlineData("no-license", "reads the license of 'ravendb' from a Secret")]
     [InlineData("two-clusters", "runs one cluster per namespace")]
+    [InlineData("database-name", "'orders; rm' is not a valid RavenDB database name")]
+    [InlineData("admin-secret", "'api' would get Secret 'ravendb-api-client-certificate'")]
+    [InlineData("certificate-file", "brings its certificate for RavenDB server 'ravendb' as a file, which only Docker Compose mounts")]
     public async Task PublishRejectsWhatTheOperatorCannotRun(string scenario, string expectedError)
     {
         using var chart = await Publish(builder =>
@@ -322,6 +361,17 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
                     break;
                 case "no-license":
                     builder.AddRavenDB("ravendb").PublishAsRavenDBCluster(ConfigureCluster);
+                    break;
+                case "database-name":
+                    AddCluster(builder).AddDatabase("orders", "orders; rm");
+                    break;
+                case "certificate-file":
+                    var orders = AddCluster(builder).AddDatabase("orders");
+                    builder.AddContainer("api", "busybox").WithReference(orders).WithRavenDBClientCertificateFile(orders, "api.pfx");
+                    break;
+                case "admin-secret":
+                    var server = AddCluster(builder, cluster => cluster.WithCertificates("ravendb-server", "ravendb-api-client-certificate"));
+                    builder.AddContainer("api", "busybox").WithReference(server);
                     break;
                 case "two-clusters":
                     AddCluster(builder);
@@ -357,6 +407,39 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         Assert.Equal("configure", exception.ParamName);
     }
 
+    [Theory]
+    [InlineData("Ravendb.Example.com")]
+    [InlineData("ravendb.example.com`) || HostSNI(`*")]
+    [InlineData("-ravendb.example.com")]
+    public void DomainThatIsNotADnsNameIsRejectedRightAway(string domain)
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Run);
+
+        var exception = Assert.Throws<ArgumentException>(() => builder.AddRavenDB("ravendb").PublishAsRavenDBCluster(cluster =>
+        {
+            ConfigureCluster(cluster);
+            cluster.Domain = domain;
+        }));
+
+        Assert.Contains("is not a domain the nodes can be published under", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("istio")]
+    [InlineData("Traefik")]
+    public void IngressControllerTheOperatorDoesNotSupportIsRejectedRightAway(string ingressClassName)
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Run);
+
+        var exception = Assert.Throws<ArgumentException>(() => builder.AddRavenDB("ravendb").PublishAsRavenDBCluster(cluster =>
+        {
+            ConfigureCluster(cluster);
+            cluster.IngressClassName = ingressClassName;
+        }));
+
+        Assert.Contains($"nginx, traefik or haproxy, not '{ingressClassName}'", exception.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void RunModeKeepsTheLocalContainer()
     {
@@ -381,6 +464,7 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         var publish = Assert.Single(steps, s => s.Name == "ravendb-cluster-publish-ravendb");
         var watch = Assert.Single(steps, s => s.Name == "ravendb-cluster-watch-ravendb");
         var wait = Assert.Single(steps, s => s.Name == "ravendb-cluster-wait-ravendb");
+        var reset = Assert.Single(steps, s => s.Name == "ravendb-cluster-reset-ravendb");
         var writeChart = new PipelineStep { Name = "publish-k8s", Action = _ => Task.CompletedTask };
         var prepareHelm = new PipelineStep { Name = "prepare-k8s", Action = _ => Task.CompletedTask };
         var helm = new PipelineStep { Name = "helm-deploy-k8s", Action = _ => Task.CompletedTask };
@@ -403,6 +487,10 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
 
         Assert.Contains("helm-deploy-k8s", wait.DependsOnSteps);
         Assert.Contains(WellKnownPipelineSteps.Deploy, wait.RequiredBySteps);
+
+        // A bootstrap Job that failed is deleted before Helm, which then creates it again.
+        Assert.Contains("ravendb-cluster-reset-ravendb", helm.DependsOnSteps);
+        Assert.Contains("prepare-k8s", reset.DependsOnSteps);
     }
 
     [Fact]
@@ -443,7 +531,8 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
     private async Task<PublishedChart> Publish(
         Action<IDistributedApplicationTestingBuilder> configure,
         bool addEnvironment = true,
-        DirectoryInfo? into = null)
+        DirectoryInfo? into = null,
+        string? chartDirectory = null)
     {
         var directory = into ?? Directory.CreateTempSubdirectory(".ravendb-cluster-publish-test");
         var errors = new List<string>();
@@ -471,12 +560,13 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
             errors.Add(exception.Message);
         }
 
-        return new PublishedChart(directory, errors, ownsDirectory: into is null);
+        return new PublishedChart(directory, chartDirectory, errors, ownsDirectory: into is null);
     }
 
-    private sealed class PublishedChart(DirectoryInfo directory, List<string> errors, bool ownsDirectory) : IDisposable
+    private sealed class PublishedChart(DirectoryInfo directory, string? chartDirectory, List<string> errors, bool ownsDirectory) : IDisposable
     {
-        public string Path => directory.FullName;
+        // With several compute environments, each writes its artifacts to a directory of its own.
+        public string Path => chartDirectory is null ? directory.FullName : System.IO.Path.Combine(directory.FullName, chartDirectory);
 
         public IReadOnlyList<string> Errors
         {

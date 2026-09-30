@@ -12,6 +12,9 @@
 # RAVENDB_APPLICATIONS ("secret=db1,db2 ..."), RAVENDB_SECRET_OWNER.
 
 set -euo pipefail
+# No filename expansion of the settings, and only this user may read the keys written below.
+set -f
+umask 077
 
 ADMIN_PFX=/ravendb/admin/client.pfx
 CA_CERT=/ravendb/ca/ca.crt
@@ -37,12 +40,18 @@ pkcs12() {
 pkcs12 -in "$ADMIN_PFX" -clcerts -nokeys -out "$WORK/admin.crt"
 pkcs12 -in "$ADMIN_PFX" -nocerts -nodes -out "$WORK/admin.key"
 
-RAVEN=(curl -sS --cert "$WORK/admin.crt" --key "$WORK/admin.key" -H "User-Agent: aspire-ravendb-bootstrap")
+RAVEN=(curl -sS --connect-timeout 10 --max-time 120 --cert "$WORK/admin.crt" --key "$WORK/admin.key" -H "User-Agent: aspire-ravendb-bootstrap")
 if [[ -f "$CA_CERT" ]]; then
     RAVEN+=(--cacert "$CA_CERT")
 fi
 
-KUBE=(curl -sS --cacert "$SERVICE_ACCOUNT/ca.crt" -H "Authorization: Bearer $(cat "$SERVICE_ACCOUNT/token")" -H "Content-Type: application/json")
+# The token goes in a header file, not on the command line.
+printf 'Authorization: Bearer %s\n' "$(cat "$SERVICE_ACCOUNT/token")" > "$WORK/kubernetes-headers"
+KUBE=(curl -sS --connect-timeout 10 --max-time 30 --cacert "$SERVICE_ACCOUNT/ca.crt" -H "@$WORK/kubernetes-headers" -H "Content-Type: application/json")
+
+# The applications' Secrets belong to the chart's ServiceAccount: uninstalling the chart removes them, and a Secret
+# it does not own is not the bootstrap's to take over.
+OWNER_UID=$("${KUBE[@]}" -f "$KUBERNETES_API/api/v1/namespaces/$NAMESPACE/serviceaccounts/$RAVENDB_SECRET_OWNER" | jq -r .metadata.uid)
 
 read -r -a URLS <<< "$RAVENDB_URLS"
 LEADER="${URLS[0]}"
@@ -82,7 +91,7 @@ create_databases() {
         fi
 
         status=$("${RAVEN[@]}" -o "$WORK/response" -w '%{http_code}' -X PUT -H "Content-Type: application/json" \
-            -d "{\"DatabaseName\":\"$database\"}" \
+            -d "$(jq -cn --arg name "$database" '{DatabaseName: $name}')" \
             "$LEADER/admin/databases?name=$database&replicationFactor=$RAVENDB_REPLICATION_FACTOR")
 
         case "$status" in
@@ -95,8 +104,13 @@ create_databases() {
 
 # The certificates the cluster trusts under our prefix, as "thumbprint name" lines.
 our_certificates() {
-    "${RAVEN[@]}" -f "$LEADER/admin/certificates?start=0&pageSize=1024&metadataOnly=true" \
-        | jq -r --arg prefix "$CERTIFICATE_PREFIX" '.Results[] | select(.Name | startswith($prefix)) | "\(.Thumbprint) \(.Name)"'
+    local start=0 page_size=1024 page
+    while true; do
+        page=$("${RAVEN[@]}" -f "$LEADER/admin/certificates?start=$start&pageSize=$page_size&metadataOnly=true")
+        jq -r --arg prefix "$CERTIFICATE_PREFIX" '.Results[] | select((.Name // "") | startswith($prefix)) | "\(.Thumbprint) \(.Name)"' <<< "$page"
+        [[ $(jq '.Results | length' <<< "$page") -eq $page_size ]] || return 0
+        start=$((start + page_size))
+    done
 }
 
 revoke() {
@@ -115,6 +129,12 @@ issue_application_certificate() {
     status=$("${KUBE[@]}" -o "$WORK/secret.json" -w '%{http_code}' "$KUBERNETES_API/api/v1/namespaces/$NAMESPACE/secrets/$secret")
 
     if [[ "$status" == "200" ]]; then
+        if ! jq -e --arg uid "$OWNER_UID" 'any(.metadata.ownerReferences[]?; .uid == $uid)' "$WORK/secret.json" > /dev/null; then
+            log "Secret '$secret' was not created by this bootstrap, so its certificate is not registered for the application." \
+                "Delete the Secret to get a new certificate, or mount it with WithRavenDBClientCertificateSecret."
+            exit 1
+        fi
+
         jq -r '.data["client.pfx"]' "$WORK/secret.json" | base64 -d > "$WORK/$secret.pfx"
         pkcs12 -in "$WORK/$secret.pfx" -clcerts -nokeys -out "$WORK/$secret.crt"
     elif [[ "$status" == "404" ]]; then
@@ -161,11 +181,7 @@ issue_application_certificate() {
         return 0
     fi
 
-    # The Secrets belong to the chart's ServiceAccount, so uninstalling the chart removes them.
-    local owner
-    owner=$("${KUBE[@]}" -f "$KUBERNETES_API/api/v1/namespaces/$NAMESPACE/serviceaccounts/$RAVENDB_SECRET_OWNER" | jq -r .metadata.uid)
-
-    jq -n --arg name "$secret" --arg owner "$RAVENDB_SECRET_OWNER" --arg uid "$owner" --arg pfx "$(base64 -w 0 < "$WORK/$secret.pfx")" '{
+    jq -n --arg name "$secret" --arg owner "$RAVENDB_SECRET_OWNER" --arg uid "$OWNER_UID" --arg pfx "$(base64 -w 0 < "$WORK/$secret.pfx")" '{
         apiVersion: "v1",
         kind: "Secret",
         type: "Opaque",

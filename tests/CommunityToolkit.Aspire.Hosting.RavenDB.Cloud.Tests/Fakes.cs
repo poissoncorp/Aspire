@@ -124,9 +124,14 @@ internal sealed class FakeRavenDBCloudApi : HttpMessageHandler, IRavenDBCloudApi
                 TerminatedProductIds.Add(id);
             }
 
-            return Products.TryRemove(id, out _)
-                ? new HttpResponseMessage(HttpStatusCode.Accepted)
-                : new HttpResponseMessage(HttpStatusCode.NotFound);
+            // Like the real API, a terminated product stays in the list.
+            if (!Products.TryGetValue(id, out var terminated))
+            {
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            }
+
+            terminated.Status = "Terminated";
+            return new HttpResponseMessage(HttpStatusCode.Accepted);
         }
 
         if (request.Method == HttpMethod.Get && path.StartsWith("/api/v1/metadata/instance-types/", StringComparison.Ordinal))
@@ -219,6 +224,7 @@ internal sealed class FakeRavenDBServer : IRavenDBServerAdministrationFactory
                 .Select(c => new RegisteredCertificate(
                     c.Value.Name,
                     c.Key,
+                    c.Value.Clearance,
                     new Dictionary<string, DatabaseAccess>(c.Value.Permissions, StringComparer.OrdinalIgnoreCase)))]);
 
         public Task<byte[]> CreateClientCertificateAsync(string name, IReadOnlyDictionary<string, DatabaseAccess> permissions, CancellationToken cancellationToken)
@@ -251,7 +257,10 @@ internal sealed class FakeRavenDBServer : IRavenDBServerAdministrationFactory
     }
 }
 
-internal sealed record FakeCertificate(string Name, Dictionary<string, DatabaseAccess> Permissions);
+internal sealed record FakeCertificate(
+    string Name,
+    Dictionary<string, DatabaseAccess> Permissions,
+    SecurityClearance Clearance = SecurityClearance.ValidUser);
 
 internal static class TestCertificates
 {

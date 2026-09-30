@@ -36,9 +36,11 @@ public static class RavenDBClientCertificateExtensions
         ArgumentNullException.ThrowIfNull(database);
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
 
-        // Docker Compose resolves a relative path against the compose file, which lives in the output directory.
+        // Relative to the AppHost here; the compose file gets it relative to itself.
         var file = Path.GetFullPath(path, builder.ApplicationBuilder.AppHostDirectory);
 
-        return builder.WithAnnotation(new RavenDBClientCertificateAnnotation(database.Resource.Parent, RavenDBClientCertificateSource.File, file));
+        return builder.WithAnnotation(RavenDBClientCertificates.Single(
+            builder.Resource,
+            new RavenDBClientCertificateAnnotation(database.Resource.Parent, RavenDBClientCertificateSource.File, file)));
     }
 }

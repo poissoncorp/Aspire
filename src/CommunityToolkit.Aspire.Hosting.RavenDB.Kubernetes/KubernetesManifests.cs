@@ -121,6 +121,12 @@ internal sealed class KubernetesJobSpec
 {
     public int BackoffLimit { get; set; } = 10;
 
+    /// <summary>
+    /// A bootstrap that hangs is failed after half an hour, longer than it waits for the cluster: the next deployment
+    /// then runs it again.
+    /// </summary>
+    public int ActiveDeadlineSeconds { get; set; } = 1800;
+
     public PodTemplateSpecV1 Template { get; set; } = new();
 }
 

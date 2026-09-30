@@ -19,7 +19,11 @@ internal static class RavenDBCloudClientCertificates
 {
     public const string DirectoryName = "ravendb-certs";
 
-    public static string NamePrefix(string appHost, string environment) => $"aspire.{appHost}.{environment}.".ToLowerInvariant();
+    // Dots separate the parts, so a dotted AppHost name (Contoso.AppHost) or environment must not add parts of its
+    // own: "a.b" and "c" would otherwise share a prefix with "a" and "b.c".
+    public static string NamePrefix(string appHost, string environment) =>
+        $"aspire.{appHost.Replace('.', '-')}.{environment.Replace('.', '-')}.".ToLowerInvariant();
 
-    public static string FileName(RavenDBServerResource server, string consumer) => $"{server.Name}-{consumer}.pfx".ToLowerInvariant();
+    // Resource names never contain "--", so it tells the server's name from the application's.
+    public static string FileName(RavenDBServerResource server, string consumer) => $"{server.Name}--{consumer}.pfx".ToLowerInvariant();
 }

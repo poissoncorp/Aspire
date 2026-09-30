@@ -1,4 +1,4 @@
-#pragma warning disable ASPIREPIPELINES001 // Pipeline APIs are experimental
+#pragma warning disable ASPIREPIPELINES001, ASPIREPIPELINES004 // Pipeline APIs are experimental
 
 using System.Globalization;
 using System.Text;
@@ -10,6 +10,7 @@ using Aspire.Hosting.Docker.Resources;
 using Aspire.Hosting.Docker.Resources.ComposeNodes;
 using Aspire.Hosting.Docker.Resources.ServiceNodes;
 using Aspire.Hosting.Pipelines;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace CommunityToolkit.Aspire.Hosting.RavenDB;
@@ -64,7 +65,7 @@ internal static partial class RavenDBPublishing
                 RemoveDependenciesOnServer(builder, @event.Model);
             }
 
-            MountBroughtCertificates(builder, consumers, composeEnvironments);
+            MountBroughtCertificates(builder, consumers, composeEnvironments, @event.Services.GetRequiredService<IPipelineOutputService>());
 
             return Task.CompletedTask;
         });
@@ -78,9 +79,11 @@ internal static partial class RavenDBPublishing
         {
             var validationStepName = ValidationStepName(builder.Resource);
 
+            // Every RavenDB server brings a validation step of its own, required by publish as well: they must not
+            // wait for each other.
             foreach (var step in context.Steps)
             {
-                if (step.Name != validationStepName &&
+                if (!step.Name.StartsWith(ValidationStepPrefix, StringComparison.Ordinal) &&
                     (step.Name.StartsWith("publish-", StringComparison.Ordinal) ||
                      step.RequiredBySteps.Contains(WellKnownPipelineSteps.Publish)))
                 {
@@ -90,7 +93,9 @@ internal static partial class RavenDBPublishing
         });
     }
 
-    private static string ValidationStepName(RavenDBServerResource server) => $"validate-ravendb-{server.Name}";
+    private const string ValidationStepPrefix = "validate-ravendb-";
+
+    private static string ValidationStepName(RavenDBServerResource server) => ValidationStepPrefix + server.Name;
 
     private static void ConfigureDockerCompose(
         IResourceBuilder<RavenDBServerResource> builder,
@@ -117,8 +122,14 @@ internal static partial class RavenDBPublishing
             });
         }
 
+        // AddDatabase(ensureCreated: true) is honoured by the AppHost process in run mode only. In a deployed
+        // stack the same databases are created by a one-shot service. Secured servers need a client certificate
+        // inside that service, which is not supported yet (the validation step warns).
+        var createsDatabases = !server.IsSecured && server.DatabasesToCreate.Count > 0;
+
         // Aspire maps WaitFor(...) to `condition: service_started`. The service has a health check (ours, or the
-        // image's for secured servers), so dependents can wait until it is healthy.
+        // image's for secured servers), so dependents can wait until it is healthy, and until the bootstrap has
+        // created the databases, as they do in run mode.
         foreach (var dependent in model.Resources.OfType<IComputeResource>())
         {
             if (ReferenceEquals(dependent, server) || !WaitsFor(dependent, server))
@@ -129,20 +140,22 @@ internal static partial class RavenDBPublishing
             builder.ApplicationBuilder.CreateResourceBuilder(dependent)
                 .PublishAsDockerComposeService((_, service) =>
                 {
-                    foreach (var (name, dependency) in service.DependsOn)
+                    foreach (var (name, dependency) in service.DependsOn.ToList())
                     {
                         if (string.Equals(name, server.Name, StringComparison.OrdinalIgnoreCase))
                         {
                             dependency.Condition = "service_healthy";
+
+                            if (createsDatabases)
+                            {
+                                service.DependsOn[BootstrapServiceName(name)] = new() { Condition = "service_completed_successfully" };
+                            }
                         }
                     }
                 });
         }
 
-        // AddDatabase(ensureCreated: true) is honoured by the AppHost process in run mode only. In a deployed
-        // stack the same databases are created by a one-shot service. Secured servers need a client certificate
-        // inside that service, which is not supported yet (the validation step warns).
-        if (server.IsSecured || server.DatabasesToCreate.Count == 0)
+        if (!createsDatabases)
         {
             return;
         }
@@ -196,7 +209,8 @@ internal static partial class RavenDBPublishing
     private static void MountBroughtCertificates(
         IResourceBuilder<RavenDBServerResource> builder,
         IReadOnlyList<RavenDBConsumer> consumers,
-        IReadOnlyList<DockerComposeEnvironmentResource> composeEnvironments)
+        IReadOnlyList<DockerComposeEnvironmentResource> composeEnvironments,
+        IPipelineOutputService output)
     {
         foreach (var consumer in consumers)
         {
@@ -207,11 +221,20 @@ internal static partial class RavenDBPublishing
 
             foreach (var environment in composeEnvironments)
             {
+                // Docker Compose resolves the path against the compose file. Relative to it, the published artifacts
+                // keep working on another machine with the same layout, such as a CI runner.
+                var directory = OutputDirectory(output, environment, composeEnvironments.Count);
+                var path = Path.GetRelativePath(directory, certificate.Location).Replace('\\', '/');
+
                 builder.ApplicationBuilder.CreateResourceBuilder(environment)
-                    .ConfigureComposeFile(file => RavenDBComposeCertificates.Mount(file, builder.Resource, consumer, certificate.Location));
+                    .ConfigureComposeFile(file => RavenDBComposeCertificates.Mount(file, builder.Resource, consumer, path));
             }
         }
     }
+
+    /// <summary>Where an environment writes its artifacts: its own directory once there are several.</summary>
+    internal static string OutputDirectory(IPipelineOutputService output, IResource environment, int environmentCount) =>
+        environmentCount > 1 ? output.GetOutputDirectory(environment) : output.GetOutputDirectory();
 
     private static void AddBootstrapService(ComposeFile file, RavenDBServerResource server, int targetPort)
     {
@@ -224,7 +247,7 @@ internal static partial class RavenDBPublishing
             return;
         }
 
-        var bootstrapName = $"{serviceName}-bootstrap";
+        var bootstrapName = BootstrapServiceName(serviceName);
 
         if (file.Services.ContainsKey(bootstrapName))
         {
@@ -246,13 +269,16 @@ internal static partial class RavenDBPublishing
         };
     }
 
+    private static string BootstrapServiceName(string serverServiceName) => $"{serverServiceName}-bootstrap";
+
     /// <summary>
     /// A POSIX shell script that creates the given databases if they do not exist.
     /// </summary>
     /// <remarks>
     /// The script contains no shell variables, because Docker Compose interpolates <c>$VAR</c> in the file.
     /// <c>GET /databases?name=x</c> answers 404 for a missing database and 200 for an existing one, and
-    /// <c>PUT /admin/databases</c> answers 409 for an existing one, so running it again changes nothing.
+    /// <c>PUT /admin/databases</c> answers 409 for an existing one, so running it again changes nothing. A database
+    /// that could not be created fails the service, and with it the applications that wait for it.
     /// </remarks>
     internal static string BuildBootstrapScript(string serverUrl, IEnumerable<string> databases)
     {
@@ -268,10 +294,14 @@ internal static partial class RavenDBPublishing
             script
                 .Append(CultureInfo.InvariantCulture, $"if curl -sf '{serverUrl}/databases?name={database}' >/dev/null 2>&1; ")
                 .Append(CultureInfo.InvariantCulture, $"then echo 'ravendb-bootstrap: database {database} already exists'; ")
-                .Append(CultureInfo.InvariantCulture, $"else curl -sf -X PUT '{serverUrl}/admin/databases?name={database}&replicationFactor=1' ")
+                .Append(CultureInfo.InvariantCulture, $"elif curl -sf -X PUT '{serverUrl}/admin/databases?name={database}&replicationFactor=1' ")
                 .Append("-H 'Content-Type: application/json' ")
-                .Append(CultureInfo.InvariantCulture, $"-d '{{\"DatabaseName\":\"{database}\"}}' >/dev/null ")
-                .Append(CultureInfo.InvariantCulture, $"&& echo 'ravendb-bootstrap: created database {database}'; fi; ");
+                .Append(CultureInfo.InvariantCulture, $"-d '{{\"DatabaseName\":\"{database}\"}}' >/dev/null; ")
+                .Append(CultureInfo.InvariantCulture, $"then echo 'ravendb-bootstrap: created database {database}'; ")
+                // Created meanwhile by someone else: fine. Otherwise the database is missing.
+                .Append(CultureInfo.InvariantCulture, $"elif curl -sf '{serverUrl}/databases?name={database}' >/dev/null 2>&1; ")
+                .Append(CultureInfo.InvariantCulture, $"then echo 'ravendb-bootstrap: database {database} already exists'; ")
+                .Append(CultureInfo.InvariantCulture, $"else echo 'ravendb-bootstrap: creating database {database} failed' >&2; exit 1; fi; ");
         }
 
         return script.Append("echo 'ravendb-bootstrap: done'").ToString();
@@ -281,7 +311,7 @@ internal static partial class RavenDBPublishing
     /// RavenDB database names are letters, digits, '_', '-' and '.'. Anything else would also break the script's
     /// quoting, so it is rejected at publish time rather than at deploy time.
     /// </summary>
-    private static void EnsureValidDatabaseName(string database)
+    internal static void EnsureValidDatabaseName(string database)
     {
         if (!DatabaseNamePattern().IsMatch(database))
         {
@@ -303,6 +333,7 @@ internal static partial class RavenDBPublishing
             Action = context =>
             {
                 Validate(server, context.Logger);
+                WarnAboutMissingCertificateFiles(context.Model, server, context.Logger);
                 return Task.CompletedTask;
             },
         };
@@ -368,6 +399,23 @@ internal static partial class RavenDBPublishing
                 "at the configured path (for example through WithBindMount), and databases declared with " +
                 "ensureCreated are not created in deployed environments yet.",
                 server.Name);
+        }
+    }
+
+    /// <summary>The artifacts can be published before the owner's certificate files are in place, but not deployed.</summary>
+    private static void WarnAboutMissingCertificateFiles(DistributedApplicationModel model, RavenDBServerResource server, ILogger logger)
+    {
+        foreach (var consumer in RavenDBConsumers.Find(model, server))
+        {
+            if (consumer.OwnCertificate(RavenDBClientCertificateSource.File) is { } certificate && !File.Exists(certificate.Location))
+            {
+                logger.LogWarning(
+                    "The client certificate of '{Resource}' for RavenDB server '{Server}' does not exist yet: {File}. Docker " +
+                    "Compose cannot start the application until it does.",
+                    consumer.Resource.Name,
+                    server.Name,
+                    certificate.Location);
+            }
         }
     }
 

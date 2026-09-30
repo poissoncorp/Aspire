@@ -1,4 +1,3 @@
-using System.Globalization;
 using Aspire.Hosting.ApplicationModel;
 
 namespace CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes;
@@ -49,8 +48,5 @@ internal sealed class RavenDBClusterDeployment(RavenDBServerResource server, Rav
 
     public string ApplicationSecretName(IResource consumer) => $"{ResourceName}-{consumer.Name.ToLowerInvariant()}-client-certificate";
 
-    public static string NodeTag(int index) =>
-        index < 26
-            ? ((char)('a' + index)).ToString()
-            : "n" + index.ToString(CultureInfo.InvariantCulture);
+    public static string NodeTag(int index) => ((char)('a' + index)).ToString();
 }

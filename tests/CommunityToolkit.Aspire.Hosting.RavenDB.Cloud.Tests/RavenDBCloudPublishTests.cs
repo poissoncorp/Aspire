@@ -41,13 +41,13 @@ public class RavenDBCloudPublishTests
             Assert.Contains("Aspire__RavenDB__Client__orders__CertificatePath: \"/run/secrets/ravendb-ravendb.pfx\"", compose);
             Assert.Contains("""
                     secrets:
-                      - source: "ravendb-ravendb-consumer-certificate"
+                      - source: "ravendb-ravendb--consumer-certificate"
                         target: "ravendb-ravendb.pfx"
                 """.ReplaceLineEndings("\n"), compose.ReplaceLineEndings("\n"));
             Assert.Contains("""
                 secrets:
-                  ravendb-ravendb-consumer-certificate:
-                    file: "./ravendb-certs/ravendb-consumer.pfx"
+                  ravendb-ravendb--consumer-certificate:
+                    file: "./ravendb-certs/ravendb--consumer.pfx"
                 """.ReplaceLineEndings("\n"), compose.ReplaceLineEndings("\n"));
         }
         finally
@@ -82,15 +82,47 @@ public class RavenDBCloudPublishTests
 
             var compose = File.ReadAllText(Path.Combine(output.FullName, "docker-compose.yaml")).ReplaceLineEndings("\n");
 
-            Assert.Contains($"""
-                  ravendb-ravendb-api-certificate:
-                    file: "{owned.Replace("\\", "\\\\")}"
+            // Relative to the compose file, next to which it lies.
+            Assert.Contains("""
+                  ravendb-ravendb--api-certificate:
+                    file: "api.pfx"
                 """.ReplaceLineEndings("\n"), compose);
             Assert.Contains("""
-                  ravendb-ravendb-worker-certificate:
-                    file: "./ravendb-certs/ravendb-worker.pfx"
+                  ravendb-ravendb--worker-certificate:
+                    file: "./ravendb-certs/ravendb--worker.pfx"
                 """.ReplaceLineEndings("\n"), compose);
-            Assert.DoesNotContain("ravendb-certs/ravendb-api.pfx", compose);
+            Assert.DoesNotContain("ravendb-certs/ravendb--api.pfx", compose);
+        }
+        finally
+        {
+            output.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task CertificateBroughtAsAKubernetesSecretIsRejected()
+    {
+        var output = Directory.CreateTempSubdirectory(".ravendb-cloud-publish-test");
+
+        try
+        {
+            using var builder = TestDistributedApplicationBuilder.Create(
+                "AppHost:Operation=publish", $"Pipeline:OutputPath={output.FullName}", "Pipeline:Step=publish");
+
+            builder.Configuration["Parameters:ravendb-cloud-api-key"] = "test-api-key";
+            builder.AddDockerComposeEnvironment("compose");
+
+            var server = builder.AddRavenDB("ravendb").PublishAsRavenDBCloud(builder.AddParameter("ravendb-cloud-api-key", secret: true));
+            var orders = server.AddDatabase("orders");
+
+            builder.AddContainer("api", "busybox")
+                .WithReference(orders)
+                .WithAnnotation(new RavenDBClientCertificateAnnotation(server.Resource, RavenDBClientCertificateSource.KubernetesSecret, "api-cert"));
+
+            using var app = builder.Build();
+            var exception = await Assert.ThrowsAnyAsync<Exception>(() => app.RunAsync(TestContext.Current.CancellationToken));
+
+            Assert.Contains("as a Kubernetes Secret, which only Kubernetes mounts", exception.ToString(), StringComparison.Ordinal);
         }
         finally
         {
@@ -196,6 +228,23 @@ public class RavenDBCloudPublishTests
         Assert.Equal("configure", exception.ParamName);
     }
 
+    [Theory]
+    [InlineData("http://api.cloud.example.com")]
+    [InlineData("not a url")]
+    public void ApiKeyOnlyGoesToAnHttpsEndpoint(string endpoint)
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+
+        var exception = Assert.Throws<ArgumentException>(() => builder.AddRavenDB("ravendb")
+            .PublishAsRavenDBCloud(builder.AddParameter("ravendb-cloud-api-key", secret: true), cloud => cloud.ApiEndpoint = endpoint));
+
+        Assert.Contains("must be an https URL", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DottedAppHostAndEnvironmentNamesDoNotAddPartsToTheCertificateNames() =>
+        Assert.Equal("aspire.contoso-apphost.prod-eu.", RavenDBCloudClientCertificates.NamePrefix("Contoso.AppHost", "prod.eu"));
+
     [Fact]
     public void StepsHaveStableNamesAndDependencies()
     {
@@ -255,6 +304,29 @@ public class RavenDBCloudPublishTests
 
         // The application stops before the product is terminated.
         Assert.Contains("destroy-compose-compose", steps["ravendb-cloud-destroy-ravendb"].DependsOnSteps);
+    }
+
+    [Fact]
+    public void ApplicationOnKubernetesIsRejectedBeforeAnythingIsProvisioned()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        var k8s = builder.AddKubernetesEnvironment("k8s");
+        var deployment = CreateDeployment(builder, "Production");
+
+        builder.AddContainer("api", "busybox")
+            .WithReference(builder.CreateResourceBuilder(deployment.Server))
+            .WithAnnotation(new DeploymentTargetAnnotation(k8s.Resource) { ComputeEnvironment = k8s.Resource });
+
+        using var services = new ServiceCollection().BuildServiceProvider();
+
+        var exception = Assert.Throws<InvalidOperationException>(() => RavenDBCloudPipelineSteps.Configure(deployment, new PipelineConfigurationContext
+        {
+            Services = services,
+            Steps = [.. RavenDBCloudPipelineSteps.Create(deployment), new PipelineStep { Name = "helm-deploy-k8s", Action = _ => Task.CompletedTask }],
+            Model = new DistributedApplicationModel(builder.Resources),
+        }));
+
+        Assert.StartsWith("'api' is deployed to Kubernetes ('k8s')", exception.Message, StringComparison.Ordinal);
     }
 
     private static RavenDBCloudDeployment CreateDeployment(string environmentName) =>

@@ -103,6 +103,8 @@ internal static class RavenDBCloudPipelineSteps
     /// </summary>
     public static void Configure(RavenDBCloudDeployment deployment, PipelineConfigurationContext context)
     {
+        RejectApplicationsOnKubernetes(deployment, context);
+
         var server = deployment.Server;
         var provision = context.Steps.FirstOrDefault(s => s.Name == ProvisionStepName(server));
         var configure = context.Steps.FirstOrDefault(s => s.Name == ConfigureStepName(server));
@@ -154,6 +156,27 @@ internal static class RavenDBCloudPipelineSteps
     }
 
     /// <summary>
+    /// A Kubernetes chart gets neither the product URL nor the applications' certificates yet, so an application
+    /// deployed there could not reach the product. Stopping here fails the pipeline before anything is provisioned.
+    /// </summary>
+    private static void RejectApplicationsOnKubernetes(RavenDBCloudDeployment deployment, PipelineConfigurationContext context)
+    {
+        foreach (var consumer in RavenDBConsumers.Find(context.Model, deployment.Server))
+        {
+            // Aspire's Kubernetes environments deploy through a helm-deploy-<environment> step.
+            if (consumer.Resource.Annotations.OfType<DeploymentTargetAnnotation>().FirstOrDefault()?.ComputeEnvironment is { } environment &&
+                context.Steps.Any(s => s.Name == $"helm-deploy-{environment.Name}"))
+            {
+                throw new InvalidOperationException(
+                    $"'{consumer.Resource.Name}' is deployed to Kubernetes ('{environment.Name}'), where this integration does not " +
+                    $"deliver the URL and certificate of RavenDB Cloud server '{deployment.Server.Name}' yet. Deploy " +
+                    $"'{consumer.Resource.Name}' with Docker Compose, or publish '{deployment.Server.Name}' with PublishAsExisting(url) " +
+                    "and mount the application's certificate with WithRavenDBClientCertificateSecret.");
+            }
+        }
+    }
+
+    /// <summary>
     /// Fills the product URL into the environment files the compute environments generated.
     /// </summary>
     /// <remarks>
@@ -180,7 +203,7 @@ internal static class RavenDBCloudPipelineSteps
 
         foreach (var environment in environments)
         {
-            var directory = GetOutputDirectory(outputService, environment, environments.Count);
+            var directory = RavenDBPublishing.OutputDirectory(outputService, environment, environments.Count);
 
             foreach (var fileName in new[] { ".env", $".env.{environmentName}" })
             {
@@ -238,7 +261,7 @@ internal static class RavenDBCloudPipelineSteps
         var prefix = RavenDBCloudClientCertificates.NamePrefix(host?.ApplicationName ?? "apphost", host?.EnvironmentName ?? "Production");
 
         string DirectoryOf(IComputeEnvironmentResource environment) =>
-            Path.Combine(GetOutputDirectory(outputService, environment, environments.Count), RavenDBCloudClientCertificates.DirectoryName);
+            Path.Combine(RavenDBPublishing.OutputDirectory(outputService, environment, environments.Count), RavenDBCloudClientCertificates.DirectoryName);
 
         var requests = new List<ClientCertificateRequest>();
 
@@ -282,9 +305,6 @@ internal static class RavenDBCloudPipelineSteps
 
         return new ClientCertificatePlan(prefix, directories, requests);
     }
-
-    private static string GetOutputDirectory(IPipelineOutputService outputService, IComputeEnvironmentResource environment, int environmentCount) =>
-        environmentCount > 1 ? outputService.GetOutputDirectory(environment) : outputService.GetOutputDirectory();
 
     /// <summary>How Docker Compose names the variable of a value expression: <c>{ravendb.url}</c> is <c>RAVENDB_URL</c>.</summary>
     internal static string ToEnvironmentVariableName(string valueExpression) =>

@@ -6,6 +6,7 @@ Deploys the [RavenDB hosting integration](https://www.nuget.org/packages/Communi
 
 ### Prerequisites
 
+- Helm 4 on the machine that runs `aspire deploy`: Aspire's Kubernetes deployment installs the chart with it.
 - The RavenDB operator, with cert-manager, installed once per Kubernetes cluster (see below).
 - An ingress controller the operator can publish the nodes through (`nginx`, `traefik` or `haproxy`). Traefik does not pass TLS through for the operator's Ingress, so for `traefik` the chart adds an `IngressRouteTCP` that does, on the `websecure` entry point: Traefik needs its Kubernetes CRD provider enabled and `websecure` exposed on port 443.
 - DNS for the nodes, inside the cluster as well, before the nodes start: node `a` is `https://a.<domain>:443`, and the operator's own bootstrap and the applications connect through those names. Each node checks its own URL once when it starts; with a private certificate authority, nodes that could not reach themselves reject each other until they restart.
@@ -24,7 +25,7 @@ The operator reads the `.pfx` files with SHA-1 and 3DES only, which is not what 
 Install cert-manager and the operator outside the AppHost, once per Kubernetes cluster: the operator's chart owns the `RavenDBCluster` definition, so uninstalling it removes every RavenDB cluster in Kubernetes. This integration is tested with operator 2.0.0:
 
 ```bash
-helm install cert-manager oci://quay.io/jetstack/charts/cert-manager -n cert-manager --create-namespace --set crds.enabled=true
+helm install cert-manager oci://quay.io/jetstack/charts/cert-manager --version v1.21.2 -n cert-manager --create-namespace --set crds.enabled=true
 helm install ravendb-operator ravendb-operator --repo https://ravendb.github.io/ravendb-operator/helm --version 2.0.0 -n ravendb-operator-system --create-namespace
 ```
 
@@ -61,7 +62,7 @@ builder.AddProject<Projects.MyService>("api")
 The chart then contains, next to the application:
 
 - the `RavenDBCluster` the operator reconciles, and a Secret with the license;
-- a bootstrap Job, with a ServiceAccount and a Role limited to the applications' Secrets, that waits until every node has joined, creates the databases declared with `ensureCreated: true`, and gives every application a client certificate of its own.
+- a bootstrap Job, with a ServiceAccount and a Role that reads only the applications' Secrets and may create Secrets (Kubernetes cannot limit creation to given names), that waits until every node has joined, creates the databases declared with `ensureCreated: true`, and gives every application a client certificate of its own. It runs as the image's non-root user, and keeps the keys it handles in memory.
 
 `aspire deploy` installs the chart and waits for the bootstrap Job to complete. The operator only runs pinned images, so set `Image` (or `WithImageTag(...)`) to a concrete tag. It runs one cluster per namespace.
 
@@ -76,6 +77,8 @@ Each application gets a certificate with `ValidUser` clearance and read/write ac
 ```csharp
 builder.AddRavenDBClient("mydb");
 ```
+
+Leave the client's `CreateDatabase` setting off: the deployment creates the databases declared with `ensureCreated: true`, and the application's certificate may neither look databases up nor create them, so a client that tries fails when it starts.
 
 With a certificate authority of its own, the application trusts it through `SSL_CERT_DIR`, next to the image's own trusted roots. The applications never get the admin certificate.
 

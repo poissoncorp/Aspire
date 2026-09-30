@@ -65,6 +65,15 @@ public static class RavenDBCloudBuilderExtensions
                 nameof(configure));
         }
 
+        // The API key has account-owner rights; plain HTTP is only for a local stand-in of the API.
+        if (!Uri.TryCreate(options.ApiEndpoint, UriKind.Absolute, out var endpoint) ||
+            (endpoint.Scheme != Uri.UriSchemeHttps && !endpoint.IsLoopback))
+        {
+            throw new ArgumentException(
+                $"The RavenDB Cloud API endpoint '{options.ApiEndpoint}' must be an https URL: the API key sent to it has account-owner rights.",
+                nameof(configure));
+        }
+
         var deployment = new RavenDBCloudDeployment(
             builder.Resource,
             apiKey.Resource,
@@ -80,7 +89,10 @@ public static class RavenDBCloudBuilderExtensions
         // it; the deploy step issues it and writes it next to the compose file.
         builder.ApplicationBuilder.Eventing.Subscribe<BeforeStartEvent>((@event, _) =>
         {
-            var consumers = RavenDBConsumers.Find(@event.Model, builder.Resource).Where(c => !c.BringsOwnCertificate).ToList();
+            var all = RavenDBConsumers.Find(@event.Model, builder.Resource);
+            RavenDBClientCertificates.EnsureMountable(all, builder.Resource, RavenDBClientCertificateSource.File);
+
+            var consumers = all.Where(c => !c.BringsOwnCertificate).ToList();
 
             foreach (var environment in @event.Model.Resources.OfType<DockerComposeEnvironmentResource>())
             {

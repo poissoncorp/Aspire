@@ -14,8 +14,9 @@ internal interface IRavenDBCloudApiClientFactory
 
 internal sealed class RavenDBCloudApiClientFactory : IRavenDBCloudApiClientFactory
 {
+    // No redirects: HttpClient would send the X-Api-Key header, which has account-owner rights, to wherever they point.
     public RavenDBCloudApiClient Create(string endpoint, string apiKey) =>
-        new(new HttpClient(), endpoint, apiKey, ownsHttpClient: true);
+        new(new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }), endpoint, apiKey, ownsHttpClient: true);
 }
 
 /// <summary>
@@ -199,18 +200,11 @@ internal sealed record InstanceTypesResponse(IReadOnlyList<InstanceTypeItem>? In
 
 internal sealed record InstanceTypeItem(string? Name, string? Tier, InstanceTypeParameters? Parameters);
 
-internal sealed record InstanceTypeParameters(
-    int? VirtualCpus,
-    double? Ram,
-    IReadOnlyList<int>? AvailableDiskSizes,
-    int? NumberOfNodes,
-    IReadOnlyList<StorageTypeInfo>? AvailableStorageTypes);
-
-internal sealed record StorageTypeInfo(string? Name);
+internal sealed record InstanceTypeParameters(int? VirtualCpus, double? Ram, IReadOnlyList<int>? AvailableDiskSizes);
 
 internal sealed record ReleaseChannelsResponse(string? DefaultReleaseChannel, IReadOnlyList<ReleaseChannelItem>? ReleaseChannels);
 
-internal sealed record ReleaseChannelItem(string? Name, string? RavenVersion);
+internal sealed record ReleaseChannelItem(string? Name);
 
 /// <summary>Values of <c>ProductStatus</c>.</summary>
 internal static class ProductStatus

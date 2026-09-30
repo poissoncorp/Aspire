@@ -2,6 +2,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Aspire.Hosting.Pipelines;
 using Microsoft.Extensions.Logging;
 using Raven.Client.ServerWide.Operations.Certificates;
@@ -18,7 +19,7 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud;
 /// product, so a deployment from a machine without that state (a CI runner) finds the same product and ends with the
 /// same certificates.
 /// </remarks>
-internal sealed class RavenDBCloudProvisioner(
+internal sealed partial class RavenDBCloudProvisioner(
     RavenDBCloudApiClient client,
     IDeploymentStateManager state,
     IRavenDBServerAdministrationFactory servers,
@@ -131,7 +132,12 @@ internal sealed class RavenDBCloudProvisioner(
         foreach (var stale in registered.Where(c => plan.Requests.All(r => !IsNamed(c, r.CertificateName))))
         {
             await RevokeAsync(server, stale, cancellationToken).ConfigureAwait(false);
-            DeleteFiles(deployment, plan, stale.Name[plan.NamePrefix.Length..]);
+
+            // The name comes from the server: only a resource name maps to a file of ours.
+            if (ResourceNamePattern().IsMatch(stale.Name[plan.NamePrefix.Length..]))
+            {
+                DeleteFiles(deployment, plan, stale.Name[plan.NamePrefix.Length..]);
+            }
         }
     }
 
@@ -201,7 +207,7 @@ internal sealed class RavenDBCloudProvisioner(
 
         if (registered.FirstOrDefault(c => IsNamed(c, request.CertificateName) && IsSame(c.Thumbprint, onDisk)) is { } current)
         {
-            if (GrantsExactly(current, permissions))
+            if (IsUpToDate(current, permissions))
             {
                 logger.LogInformation("Client certificate of '{Consumer}' ({Thumbprint}) is up to date.", request.Consumer, current.Thumbprint);
             }
@@ -310,25 +316,25 @@ internal sealed class RavenDBCloudProvisioner(
         }
 
         var products = await client.ListProductsAsync(cancellationToken).ConfigureAwait(false);
-        var matches = products
-            .Where(p => p.Id is not null && string.Equals(p.Name, deployment.ProductName, StringComparison.OrdinalIgnoreCase))
-            .ToList();
+        var live = new List<(string Id, ProductDetails Details)>();
 
-        if (matches.Count > 1)
+        // A terminated product stays in the list for a while: only the live ones count.
+        foreach (var match in products.Where(p => p.Id is not null && string.Equals(p.Name, deployment.ProductName, StringComparison.OrdinalIgnoreCase)))
+        {
+            if (await client.GetProductAsync(match.Id!, cancellationToken).ConfigureAwait(false) is { } details && !IsGone(details.Status))
+            {
+                live.Add((match.Id!, details));
+            }
+        }
+
+        if (live.Count > 1)
         {
             throw new InvalidOperationException(
-                $"The account has {matches.Count} RavenDB Cloud products named '{deployment.ProductName}'. Give the product " +
+                $"The account has {live.Count} RavenDB Cloud products named '{deployment.ProductName}'. Give the product " +
                 "a unique name with ProductName.");
         }
 
-        if (matches.Count == 0)
-        {
-            return (null, null);
-        }
-
-        var details = await client.GetProductAsync(matches[0].Id!, cancellationToken).ConfigureAwait(false);
-
-        return details is null || IsGone(details.Status) ? (null, null) : (matches[0].Id, details);
+        return live.Count == 0 ? (null, null) : live[0];
     }
 
     private async Task<ProductCreateRequest> BuildCreateRequestAsync(RavenDBCloudDeployment deployment, CancellationToken cancellationToken)
@@ -514,6 +520,13 @@ internal sealed class RavenDBCloudProvisioner(
         var directory = Path.GetDirectoryName(path)!;
         Directory.CreateDirectory(directory);
 
+        // Only the deploying user may enter the directory. The files keep the default mode: the application's
+        // container reads them through the compose mount, with a user of its own.
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
         // The files hold private keys: keep them out of source control even when the artifacts are committed.
         var gitignore = Path.Combine(directory, ".gitignore");
 
@@ -571,7 +584,9 @@ internal sealed class RavenDBCloudProvisioner(
     private static bool IsSame(string thumbprint, string? other) =>
         string.Equals(thumbprint, other, StringComparison.OrdinalIgnoreCase);
 
-    private static bool GrantsExactly(RegisteredCertificate certificate, IReadOnlyDictionary<string, DatabaseAccess> permissions) =>
+    // Clearance included: a certificate raised to Operator in the Studio goes back to ValidUser.
+    private static bool IsUpToDate(RegisteredCertificate certificate, IReadOnlyDictionary<string, DatabaseAccess> permissions) =>
+        certificate.Clearance == SecurityClearance.ValidUser &&
         certificate.Permissions.Count == permissions.Count &&
         permissions.All(p => certificate.Permissions.TryGetValue(p.Key, out var access) && access == p.Value);
 
@@ -586,4 +601,7 @@ internal sealed class RavenDBCloudProvisioner(
 
     private static bool ReadBool(DeploymentStateSection section, string key) =>
         section.Data.TryGetPropertyValue(key, out var node) && node is JsonValue value && value.TryGetValue<bool>(out var flag) && flag;
+
+    [GeneratedRegex("^[A-Za-z0-9-]+$")]
+    private static partial Regex ResourceNamePattern();
 }

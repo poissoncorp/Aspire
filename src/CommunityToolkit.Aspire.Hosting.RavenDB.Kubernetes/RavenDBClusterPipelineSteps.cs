@@ -10,9 +10,9 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes;
 
 /// <summary>
 /// The steps of a server published to Kubernetes: once the chart is written, drop the bootstrap Jobs of earlier
-/// configurations from it; while Helm installs it, report what keeps the cluster or the bootstrap from getting ready;
-/// after Helm, wait until the bootstrap Job has created the databases and the applications' certificates. The Job
-/// itself waits for the operator.
+/// configurations from it; before Helm, delete a bootstrap Job that failed, so that it runs again; while Helm installs
+/// the chart, report what keeps the cluster or the bootstrap from getting ready; after Helm, wait until the bootstrap
+/// Job has created the databases and the applications' certificates. The Job itself waits for the operator.
 /// </summary>
 internal static partial class RavenDBClusterPipelineSteps
 {
@@ -22,13 +22,15 @@ internal static partial class RavenDBClusterPipelineSteps
 
     public static string WaitStepName(RavenDBServerResource server) => $"ravendb-cluster-wait-{server.Name}";
 
-    public static TimeSpan Timeout { get; set; } = TimeSpan.FromMinutes(20);
+    public static string ResetStepName(RavenDBServerResource server) => $"ravendb-cluster-reset-{server.Name}";
+
+    private static readonly TimeSpan s_timeout = TimeSpan.FromMinutes(20);
 
     /// <summary>
     /// How long the watch runs next to Helm: Aspire runs <c>helm upgrade --wait</c> with Helm's default timeout of
     /// five minutes, and a watch that outlived a failed Helm would only hold the pipeline up.
     /// </summary>
-    public static TimeSpan WatchTimeout { get; set; } = TimeSpan.FromMinutes(5.5);
+    private static readonly TimeSpan s_watchTimeout = TimeSpan.FromMinutes(5.5);
 
     /// <summary>
     /// Helm creates the chart's objects within seconds of starting: a bootstrap Job that has not appeared by then means
@@ -36,7 +38,7 @@ internal static partial class RavenDBClusterPipelineSteps
     /// </summary>
     private static readonly TimeSpan s_jobAppearanceTimeout = TimeSpan.FromMinutes(2);
 
-    public static TimeSpan PollInterval { get; set; } = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan s_pollInterval = TimeSpan.FromSeconds(10);
 
     public static IEnumerable<PipelineStep> Create(RavenDBClusterDeployment deployment)
     {
@@ -62,6 +64,18 @@ internal static partial class RavenDBClusterPipelineSteps
         watch.RequiredBy(WellKnownPipelineSteps.Deploy);
         yield return watch;
 
+        var reset = new PipelineStep
+        {
+            Name = ResetStepName(deployment.Server),
+            Description = $"Deletes a failed bootstrap Job of '{deployment.Server.Name}', so that Helm creates it again",
+            Resource = deployment.Server,
+            Action = context => DeleteFailedJobAsync(deployment, context),
+        };
+
+        reset.DependsOn(WellKnownPipelineSteps.DeployPrereq);
+        reset.RequiredBy(WellKnownPipelineSteps.Deploy);
+        yield return reset;
+
         var wait = new PipelineStep
         {
             Name = WaitStepName(deployment.Server),
@@ -79,6 +93,7 @@ internal static partial class RavenDBClusterPipelineSteps
         var publish = context.Steps.FirstOrDefault(s => s.Name == PublishStepName(deployment.Server));
         var watch = context.Steps.FirstOrDefault(s => s.Name == WatchStepName(deployment.Server));
         var wait = context.Steps.FirstOrDefault(s => s.Name == WaitStepName(deployment.Server));
+        var reset = context.Steps.FirstOrDefault(s => s.Name == ResetStepName(deployment.Server));
 
         foreach (var environment in context.Model.Resources.OfType<KubernetesEnvironmentResource>())
         {
@@ -91,15 +106,22 @@ internal static partial class RavenDBClusterPipelineSteps
                 publish.DependsOn(writeChart);
             }
 
-            // Next to Helm, not after it: when the cluster does not get ready, Helm only reports a timeout.
-            if (watch is not null && context.Steps.Any(s => s.Name == prepareHelm))
+            // Next to Helm, not after it: when the cluster does not get ready, Helm only reports a timeout. The reset
+            // needs the Job's name, known once the chart is written.
+            if (context.Steps.Any(s => s.Name == prepareHelm))
             {
-                watch.DependsOn(prepareHelm);
+                watch?.DependsOn(prepareHelm);
+                reset?.DependsOn(prepareHelm);
             }
 
-            if (wait is not null && context.Steps.Any(s => s.Name == helmDeploy))
+            if (context.Steps.FirstOrDefault(s => s.Name == helmDeploy) is { } helm)
             {
-                wait.DependsOn(helmDeploy);
+                wait?.DependsOn(helm);
+
+                if (reset is not null)
+                {
+                    helm.DependsOn(reset);
+                }
             }
         }
     }
@@ -121,7 +143,7 @@ internal static partial class RavenDBClusterPipelineSteps
         var start = DateTimeOffset.UtcNow;
         var reportedRestarts = 0;
 
-        while (DateTimeOffset.UtcNow < start + WatchTimeout)
+        while (DateTimeOffset.UtcNow < start + s_watchTimeout)
         {
             var phase = await GetClusterPhaseAsync(kubectl, deployment, context.CancellationToken).ConfigureAwait(false);
 
@@ -167,7 +189,7 @@ internal static partial class RavenDBClusterPipelineSteps
                     count, job, Environment.NewLine, output.TrimEnd());
             }
 
-            await Task.Delay(PollInterval, context.CancellationToken).ConfigureAwait(false);
+            await Task.Delay(s_pollInterval, context.CancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -212,7 +234,7 @@ internal static partial class RavenDBClusterPipelineSteps
         }
 
         var output = context.Services.GetRequiredService<IPipelineOutputService>();
-        var chart = environments.Count > 1 ? output.GetOutputDirectory(environment) : output.GetOutputDirectory();
+        var chart = RavenDBPublishing.OutputDirectory(output, environment, environments.Count);
         var templates = Path.Combine(chart, "templates", deployment.BootstrapName);
 
         if (!Directory.Exists(templates))
@@ -236,6 +258,30 @@ internal static partial class RavenDBClusterPipelineSteps
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// The Job is named after its configuration, so a deployment that fixes what made it fail (DNS, a Secret) renders
+    /// the same Job, which Helm leaves as it is. Deleted, it is created again and runs anew.
+    /// </summary>
+    private static async Task DeleteFailedJobAsync(RavenDBClusterDeployment deployment, PipelineStepContext context)
+    {
+        if (deployment.BootstrapJobName is not { } job ||
+            context.Model.Resources.OfType<KubernetesEnvironmentResource>().FirstOrDefault() is not { } environment)
+        {
+            return;
+        }
+
+        var kubectl = await Kubectl.CreateAsync(environment, context.CancellationToken).ConfigureAwait(false);
+        var conditions = await kubectl.RunAsync(
+            ["get", "job", job, "--ignore-not-found", "-o", "jsonpath={range .status.conditions[*]}{.type}={.status};{end}"],
+            context.CancellationToken, throwOnError: false).ConfigureAwait(false);
+
+        if (conditions.Contains("Failed=True", StringComparison.Ordinal))
+        {
+            await kubectl.RunAsync(["delete", "job", job, "--wait=true"], context.CancellationToken).ConfigureAwait(false);
+            context.Logger.LogInformation("Deleted the failed RavenDB bootstrap Job '{Job}', so that this deployment runs it again.", job);
+        }
+    }
+
     [GeneratedRegex("^[0-9a-f]{10}\\.yaml$")]
     private static partial Regex JobFileName();
 
@@ -249,7 +295,7 @@ internal static partial class RavenDBClusterPipelineSteps
 
         var environment = context.Model.Resources.OfType<KubernetesEnvironmentResource>().First();
         var kubectl = await Kubectl.CreateAsync(environment, context.CancellationToken).ConfigureAwait(false);
-        var deadline = DateTimeOffset.UtcNow + Timeout;
+        var deadline = DateTimeOffset.UtcNow + s_timeout;
         var lastReport = DateTimeOffset.MinValue;
 
         while (true)
@@ -274,7 +320,7 @@ internal static partial class RavenDBClusterPipelineSteps
 
             if (DateTimeOffset.UtcNow > deadline)
             {
-                throw new TimeoutException($"The RavenDB bootstrap Job '{job}' did not complete within {Timeout}.");
+                throw new TimeoutException($"The RavenDB bootstrap Job '{job}' did not complete within {s_timeout}.");
             }
 
             if (DateTimeOffset.UtcNow - lastReport > TimeSpan.FromMinutes(1))
@@ -289,7 +335,7 @@ internal static partial class RavenDBClusterPipelineSteps
                     phase.Length == 0 ? string.Empty : $" (cluster: {phase})");
             }
 
-            await Task.Delay(PollInterval, context.CancellationToken).ConfigureAwait(false);
+            await Task.Delay(s_pollInterval, context.CancellationToken).ConfigureAwait(false);
         }
 
         var url = await deployment.Url.GetValueAsync(context.CancellationToken).ConfigureAwait(false);
@@ -301,18 +347,20 @@ internal static partial class RavenDBClusterPipelineSteps
     {
         public static async Task<Kubectl> CreateAsync(KubernetesEnvironmentResource environment, CancellationToken cancellationToken)
         {
-            var arguments = new List<string>();
+            // One stalled call must not outlive the step's own deadlines.
+            var arguments = new List<string> { "--request-timeout=30s" };
 
             if (environment.KubeConfigPath is { Length: > 0 } kubeConfig)
             {
                 arguments.AddRange(["--kubeconfig", kubeConfig]);
             }
 
-            if (environment.Annotations.OfType<KubernetesNamespaceAnnotation>().LastOrDefault() is { } annotation &&
-                await annotation.Namespace.GetValueAsync(cancellationToken).ConfigureAwait(false) is { Length: > 0 } ns)
-            {
-                arguments.AddRange(["--namespace", ns]);
-            }
+            // Aspire deploys to the "default" namespace when none is set, whatever the kube context says.
+            var ns = environment.Annotations.OfType<KubernetesNamespaceAnnotation>().LastOrDefault() is { } annotation
+                ? await annotation.Namespace.GetValueAsync(cancellationToken).ConfigureAwait(false)
+                : null;
+
+            arguments.AddRange(["--namespace", ns is { Length: > 0 } ? ns : "default"]);
 
             return new Kubectl(arguments);
         }
@@ -336,7 +384,16 @@ internal static partial class RavenDBClusterPipelineSteps
 
             var output = process.StandardOutput.ReadToEndAsync(cancellationToken);
             var error = process.StandardError.ReadToEndAsync(cancellationToken);
-            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+
+            try
+            {
+                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                process.Kill(entireProcessTree: true);
+                throw;
+            }
 
             if (process.ExitCode != 0 && throwOnError)
             {

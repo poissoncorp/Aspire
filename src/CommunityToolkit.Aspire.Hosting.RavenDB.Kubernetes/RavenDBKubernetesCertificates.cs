@@ -36,11 +36,11 @@ internal static class RavenDBKubernetesCertificates
         var authorityVolume = $"{name}-certificate-authority";
         var authorityDirectory = $"/ravendb/{name}-ca";
 
-        pod.Volumes.Add(new VolumeV1 { Name = certificateVolume, Secret = new SecretVolumeSourceV1 { SecretName = certificateSecret } });
+        pod.Volumes.Add(new VolumeV1 { Name = certificateVolume, Secret = SecretFile(certificateSecret, "client.pfx") });
 
         if (certificateAuthoritySecret is not null)
         {
-            pod.Volumes.Add(new VolumeV1 { Name = authorityVolume, Secret = new SecretVolumeSourceV1 { SecretName = certificateAuthoritySecret } });
+            pod.Volumes.Add(new VolumeV1 { Name = authorityVolume, Secret = SecretFile(certificateAuthoritySecret, "ca.crt") });
         }
 
         foreach (var container in pod.Containers)
@@ -56,13 +56,29 @@ internal static class RavenDBKubernetesCertificates
             {
                 container.VolumeMounts.Add(new VolumeMountV1 { Name = authorityVolume, MountPath = authorityDirectory, ReadOnly = true });
 
-                // .NET on Linux reads its trusted roots from the directories in SSL_CERT_DIR: keep the image's own
-                // and add the server's certificate authority.
-                container.Env.RemoveAll(e => e.Name == "SSL_CERT_DIR");
-                container.Env.Add(new EnvVarV1 { Name = "SSL_CERT_DIR", Value = $"/etc/ssl/certs:{authorityDirectory}" });
+                // .NET on Linux reads its trusted roots from the directories in SSL_CERT_DIR: keep the image's own,
+                // and those of other servers the application uses, and add this server's certificate authority.
+                if (container.Env.FirstOrDefault(e => e.Name == "SSL_CERT_DIR") is { } trusted)
+                {
+                    trusted.Value = $"{trusted.Value}:{authorityDirectory}";
+                }
+                else
+                {
+                    container.Env.Add(new EnvVarV1 { Name = "SSL_CERT_DIR", Value = $"/etc/ssl/certs:{authorityDirectory}" });
+                }
             }
         }
     }
+
+    /// <summary>
+    /// Mounts one key of a Secret: a certificate authority Secret made by cert-manager also holds the authority's
+    /// private key, which must not reach the pod.
+    /// </summary>
+    public static SecretVolumeSourceV1 SecretFile(string secretName, string key) => new()
+    {
+        SecretName = secretName,
+        Items = { new KeyToPathV1 { Key = key, Path = key } },
+    };
 
     private static string CertificateDirectory(RavenDBServerResource server) => $"/ravendb/{NameOf(server)}";
 

@@ -49,11 +49,13 @@ builder.AddProject<Projects.MyService>("api")
 
 RavenDB Cloud products only accept clients that present a certificate. Each application gets a certificate of its own, with `ValidUser` clearance and read/write access to the databases it references and to nothing else: `WithReference(db)` grants that database, `WithReference(server)` grants every database declared on the server with `AddDatabase(...)`.
 
-In Docker Compose the certificate is written to `ravendb-certs/` next to `docker-compose.yaml` (the directory gets a `.gitignore`), mounted into the application's container as a secret, and handed to the [RavenDB client integration](https://www.nuget.org/packages/CommunityToolkit.Aspire.RavenDB.Client) through `Aspire__RavenDB__Client__<connection name>__CertificatePath`. No application code is needed:
+In Docker Compose the certificate is written to `ravendb-certs/` next to `docker-compose.yaml` (the directory gets a `.gitignore` and, on Linux and macOS, only the deploying user may enter it; do not upload it as a CI artifact, since the files hold private keys), mounted into the application's container as a secret, and handed to the [RavenDB client integration](https://www.nuget.org/packages/CommunityToolkit.Aspire.RavenDB.Client) through `Aspire__RavenDB__Client__<connection name>__CertificatePath`. No application code is needed:
 
 ```csharp
 builder.AddRavenDBClient("mydb");
 ```
+
+Leave the client's `CreateDatabase` setting off: the deployment creates the databases declared with `ensureCreated: true`, and the application's certificate may neither look databases up nor create them, so a client that tries fails when it starts.
 
 The certificates are named `aspire.<AppHost>.<environment>.<application>`, and every deployment leaves each application with exactly one. It keeps the certificate in the application's file while the product still knows it, and updates its access when the references change. It revokes every other certificate with the application's name, so a deployment from a machine without that file, such as a CI runner, replaces the certificate instead of adding one. It also revokes the certificates of applications that are no longer deployed. Two AppHosts with the same name and environment on one product would revoke each other's certificates.
 
@@ -65,14 +67,14 @@ A product in your account with the configured name is used as it is, and `aspire
 
 ### Destroy
 
-`aspire destroy` stops the application first, revokes the client certificates and then terminates the product, but only if this deployment created it and `TerminateOnDestroy` is set. Terminating a product deletes its data. Without deployment state it still finds the product by name and revokes the certificates, but leaves the product running.
+`aspire destroy` stops the application first. It terminates the product, with its certificates, only if this deployment created it and `TerminateOnDestroy` is set; terminating a product deletes its data. A product it leaves running keeps its data and loses the applications' certificates. Without deployment state it still finds the product by name and revokes the certificates, but leaves the product running.
 
 `aspire destroy` also clears the deployment state. A product it leaves running is therefore found by name on the next deployment and treated as one this deployment did not create: terminate it in the portal once it is no longer needed.
 
 ### Current limitations
 
 - Client certificates are delivered to applications deployed with Docker Compose. Elsewhere the deployment warns, and the application needs `Aspire:RavenDB:Client:<connection name>:CertificatePath` from another source.
-- The product URL is written into the environment files of Docker Compose and passed as a Bicep parameter in Azure Container Apps. Kubernetes is not wired yet.
+- The product URL is written into the environment files of Docker Compose and passed as a Bicep parameter in Azure Container Apps. An application deployed to Kubernetes gets neither the URL nor a certificate yet, so the deployment stops before it provisions anything. Reach the product from Kubernetes with `PublishAsExisting(url)` and the application's certificate mounted through `WithRavenDBClientCertificateSecret`.
 - The Cloud API allows at most three products created through the API and about one request per second, so it is not meant for an environment per pull request.
 
 ## Feedback & contributing

@@ -31,7 +31,11 @@ internal interface IRavenDBServerAdministration : IDisposable
 }
 
 /// <summary>A certificate the server trusts. Database names in <paramref name="Permissions"/> compare case-insensitively.</summary>
-internal sealed record RegisteredCertificate(string Name, string Thumbprint, IReadOnlyDictionary<string, DatabaseAccess> Permissions);
+internal sealed record RegisteredCertificate(
+    string Name,
+    string Thumbprint,
+    SecurityClearance Clearance,
+    IReadOnlyDictionary<string, DatabaseAccess> Permissions);
 
 internal interface IRavenDBServerAdministrationFactory
 {
@@ -93,6 +97,7 @@ internal sealed class RavenDBServerAdministration : IRavenDBServerAdministration
                 .Select(c => new RegisteredCertificate(
                     c.Name,
                     c.Thumbprint,
+                    c.SecurityClearance,
                     // Database names are case-insensitive in RavenDB.
                     new Dictionary<string, DatabaseAccess>(c.Permissions ?? [], StringComparer.OrdinalIgnoreCase))));
 

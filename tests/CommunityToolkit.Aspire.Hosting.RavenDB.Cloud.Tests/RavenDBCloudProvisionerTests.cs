@@ -109,6 +109,19 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     }
 
     [Fact]
+    public async Task TerminatedProductWithTheSameNameDoesNotCount()
+    {
+        _api.AddProduct("ravendb-production", status: "Terminated");
+        var live = _api.AddProduct("ravendb-production");
+        var deployment = CreateDeployment(o => o.WithAllowedIps("203.0.113.0/24"));
+
+        await Provision(deployment);
+
+        Assert.Empty(_api.CreateRequests);
+        Assert.Equal(live.Id, deployment.ProductId);
+    }
+
+    [Fact]
     public async Task ProductAwaitingPaymentFails()
     {
         _api.AddProduct("ravendb-production", status: "AwaitingPayment");
@@ -243,6 +256,32 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     }
 
     [Fact]
+    public async Task CertificateRaisedInTheStudioGoesBackToValidUser()
+    {
+        await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"));
+        var issued = ThumbprintOnDisk("api");
+        _server.Certificates[issued] = _server.Certificates[issued] with { Clearance = SecurityClearance.Operator };
+
+        await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"));
+
+        Assert.Equal(issued, Assert.Single(_server.EditedThumbprints));
+        Assert.Equal(SecurityClearance.ValidUser, _server.Certificates[issued].Clearance);
+    }
+
+    [Fact]
+    public async Task StaleCertificateNameCannotReachFilesOutsideTheCertificateDirectory()
+    {
+        var outside = Path.Combine(_output.FullName, "keep.pfx");
+        File.WriteAllText(outside, "not ours");
+        _server.Certificates["0123456789ABCDEF0123456789ABCDEF01234567"] = new FakeCertificate($"{NamePrefix}/../../keep", []);
+
+        await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"));
+
+        Assert.Contains("0123456789ABCDEF0123456789ABCDEF01234567", _server.DeletedThumbprints);
+        Assert.True(File.Exists(outside));
+    }
+
+    [Fact]
     public async Task DeploymentFromAnotherMachineLeavesOneCertificatePerApplication()
     {
         await IssueCertificates(await ProvisionedDeployment(), Request("api", "orders"));
@@ -369,7 +408,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
 
     private ClientCertificatePlan Plan(ClientCertificateRequest[] requests) => new(NamePrefix, [CertificateDirectory], requests);
 
-    private string CertificatePath(string consumer) => Path.Combine(CertificateDirectory, $"ravendb-{consumer}.pfx");
+    private string CertificatePath(string consumer) => Path.Combine(CertificateDirectory, $"ravendb--{consumer}.pfx");
 
     private string ThumbprintOnDisk(string consumer) => RavenDBCloudProvisioner.GetThumbprint(File.ReadAllBytes(CertificatePath(consumer)));
 
