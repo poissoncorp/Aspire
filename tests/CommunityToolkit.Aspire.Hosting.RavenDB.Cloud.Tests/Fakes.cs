@@ -230,7 +230,7 @@ internal sealed class FakeRavenDBServer : IRavenDBServerAdministrationFactory
         public Task<byte[]> CreateClientCertificateAsync(string name, IReadOnlyDictionary<string, DatabaseAccess> permissions, CancellationToken cancellationToken)
         {
             var pfx = TestCertificates.CreatePfx(name);
-            server.Certificates[RavenDBCloudProvisioner.GetThumbprint(pfx)] = new FakeCertificate(name, new Dictionary<string, DatabaseAccess>(permissions));
+            server.Certificates[RavenDBCloudClientCertificates.GetThumbprint(pfx)] = new FakeCertificate(name, new Dictionary<string, DatabaseAccess>(permissions));
 
             return Task.FromResult(TestCertificates.Bundle(name, pfx));
         }

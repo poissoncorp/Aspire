@@ -180,9 +180,9 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
             entry.Write(pfx);
         }
 
-        Assert.Equal(pfx, RavenDBCloudProvisioner.ExtractPfx(zip.ToArray()));
-        Assert.Equal(pfx, RavenDBCloudProvisioner.ExtractPfx(pfx));
-        Assert.Null(RavenDBCloudProvisioner.ExtractPfx([]));
+        Assert.Equal(pfx, RavenDBCloudClientCertificates.ExtractPfx(zip.ToArray()));
+        Assert.Equal(pfx, RavenDBCloudClientCertificates.ExtractPfx(pfx));
+        Assert.Null(RavenDBCloudClientCertificates.ExtractPfx([]));
     }
 
     [Fact]
@@ -203,7 +203,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
         Assert.Equal(["orders", "reports"], _server.Databases.Order());
         var connection = Assert.Single(_server.Connections);
         Assert.Equal("https://a.test-ravendb-production.development.run", connection.Url);
-        Assert.Equal(RavenDBCloudProvisioner.GetThumbprint(_api.AdminCertificate), connection.CertificateThumbprint);
+        Assert.Equal(RavenDBCloudClientCertificates.GetThumbprint(_api.AdminCertificate), connection.CertificateThumbprint);
     }
 
     [Fact]
@@ -410,7 +410,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
 
     private string CertificatePath(string consumer) => Path.Combine(CertificateDirectory, $"ravendb--{consumer}.pfx");
 
-    private string ThumbprintOnDisk(string consumer) => RavenDBCloudProvisioner.GetThumbprint(File.ReadAllBytes(CertificatePath(consumer)));
+    private string ThumbprintOnDisk(string consumer) => RavenDBCloudClientCertificates.GetThumbprint(File.ReadAllBytes(CertificatePath(consumer)));
 
     private FakeCertificate CertificateOnDisk(string consumer) => _server.Certificates[ThumbprintOnDisk(consumer)];
 
