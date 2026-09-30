@@ -67,7 +67,7 @@ internal sealed class RavenDBClusterExternalAccess
 
 internal sealed class RavenDBClusterIngressController
 {
-    public string IngressClassName { get; set; } = "nginx";
+    public string IngressClassName { get; set; } = "traefik";
 }
 
 /// <summary>

@@ -43,11 +43,12 @@ public sealed class RavenDBClusterOptions
     public string? StorageClassName { get; set; }
 
     /// <summary>
-    /// Gets or sets the ingress controller the operator publishes the nodes through: <c>nginx</c>, <c>traefik</c>
-    /// or <c>haproxy</c>. The default is <c>nginx</c>. For <c>traefik</c> the chart also gets the routes that pass
-    /// TLS through to the nodes, on Traefik's <c>websecure</c> entry point.
+    /// Gets or sets the ingress controller the operator publishes the nodes through: <c>traefik</c>, <c>haproxy</c>
+    /// or <c>nginx</c>. The default is <c>traefik</c>, for which the chart also gets the routes that pass TLS through
+    /// to the nodes, on Traefik's <c>websecure</c> entry point. <c>nginx</c> is ingress-nginx, which receives no
+    /// fixes since March 2026.
     /// </summary>
-    public string IngressClassName { get; set; } = "nginx";
+    public string IngressClassName { get; set; } = "traefik";
 
     /// <summary>
     /// Gets or sets the name of an existing Secret that holds the license under the key <c>license.json</c>. Not

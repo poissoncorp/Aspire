@@ -63,10 +63,10 @@ public static partial class RavenDBClusterBuilderExtensions
         }
 
         // The operator's RavenDBCluster definition accepts these three only.
-        if (options.IngressClassName is not ("nginx" or "traefik" or "haproxy"))
+        if (options.IngressClassName is not ("traefik" or "haproxy" or "nginx"))
         {
             throw new ArgumentException(
-                $"The RavenDB operator publishes the nodes through nginx, traefik or haproxy, not '{options.IngressClassName}'.",
+                $"The RavenDB operator publishes the nodes through traefik, haproxy or nginx, not '{options.IngressClassName}'.",
                 nameof(configure));
         }
 

@@ -33,15 +33,15 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         Assert.Equal("ravendb-ca", cluster.Scalar("spec", "caCertSecretRef"));
         Assert.Equal("10Gi", cluster.Scalar("spec", "storage", "data", "size"));
         Assert.Equal("ingress-controller", cluster.Scalar("spec", "externalAccessConfiguration", "type"));
-        Assert.Equal("nginx", cluster.Scalar("spec", "externalAccessConfiguration", "ingressControllerContext", "ingressClassName"));
+        Assert.Equal("traefik", cluster.Scalar("spec", "externalAccessConfiguration", "ingressControllerContext", "ingressClassName"));
 
         var nodes = cluster.Items("spec", "nodes");
         Assert.Equal(["a", "b", "c"], nodes.Select(n => n.Scalar("tag")));
         Assert.Equal("https://b.ravendb.example.test:443", nodes[1].Scalar("publicServerUrl"));
         Assert.Equal("tcp://b-tcp.ravendb.example.test:443", nodes[1].Scalar("publicServerUrlTcp"));
 
-        // nginx passes TLS through for the operator's own Ingress.
-        Assert.Empty(chart.All("IngressRouteTCP"));
+        // Traefik, the default, gets the routes that pass TLS through to the nodes.
+        Assert.Single(chart.All("IngressRouteTCP"));
 
         // A license is JSON: base64 keeps its quotes out of the quoted YAML string.
         var license = chart.Single("Secret", "ravendb-license");
@@ -197,6 +197,17 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
                 var service = r.Items("services").Single();
                 return (r.Scalar("match"), service.Scalar("name"), service.Scalar("port"));
             }));
+    }
+
+    [Theory]
+    [InlineData("haproxy")]
+    [InlineData("nginx")]
+    public async Task OtherIngressControllersPassTlsThroughForTheOperatorsIngressAlone(string ingressClassName)
+    {
+        using var chart = await Publish(builder => AddCluster(builder, cluster => cluster.IngressClassName = ingressClassName));
+
+        Assert.Equal(ingressClassName, chart.Single("RavenDBCluster").Scalar("spec", "externalAccessConfiguration", "ingressControllerContext", "ingressClassName"));
+        Assert.Empty(chart.All("IngressRouteTCP"));
     }
 
     [Fact]
@@ -437,7 +448,7 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
             cluster.IngressClassName = ingressClassName;
         }));
 
-        Assert.Contains($"nginx, traefik or haproxy, not '{ingressClassName}'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains($"traefik, haproxy or nginx, not '{ingressClassName}'", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]
