@@ -11,4 +11,8 @@
     <ProjectReference Include="..\CommunityToolkit.Aspire.Testing\CommunityToolkit.Aspire.Testing.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\CommunityToolkit.Aspire.Hosting.RavenDB.Tests\ShellScriptHarness.cs" Link="ShellScriptHarness.cs" />
+  </ItemGroup>
+
 </Project>
