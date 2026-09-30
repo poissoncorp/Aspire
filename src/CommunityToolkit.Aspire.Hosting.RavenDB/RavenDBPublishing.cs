@@ -224,10 +224,13 @@ internal static partial class RavenDBPublishing
                 // Docker Compose resolves the path against the compose file. Relative to it, the published artifacts
                 // keep working on another machine with the same layout, such as a CI runner.
                 var directory = OutputDirectory(output, environment, composeEnvironments.Count);
-                var path = Path.GetRelativePath(directory, certificate.Location).Replace('\\', '/');
+                string RelativeToCompose(string file) => Path.GetRelativePath(directory, file).Replace('\\', '/');
+
+                var path = RelativeToCompose(certificate.Location);
+                var authority = certificate.CertificateAuthority is { } file ? RelativeToCompose(file) : null;
 
                 builder.ApplicationBuilder.CreateResourceBuilder(environment)
-                    .ConfigureComposeFile(file => RavenDBComposeCertificates.Mount(file, builder.Resource, consumer, path));
+                    .ConfigureComposeFile(compose => RavenDBComposeCertificates.Mount(compose, builder.Resource, consumer, path, authority));
             }
         }
     }
@@ -407,14 +410,22 @@ internal static partial class RavenDBPublishing
     {
         foreach (var consumer in RavenDBConsumers.Find(model, server))
         {
-            if (consumer.OwnCertificate(RavenDBClientCertificateSource.File) is { } certificate && !File.Exists(certificate.Location))
+            if (consumer.OwnCertificate(RavenDBClientCertificateSource.File) is not { } certificate)
             {
-                logger.LogWarning(
-                    "The client certificate of '{Resource}' for RavenDB server '{Server}' does not exist yet: {File}. Docker " +
-                    "Compose cannot start the application until it does.",
-                    consumer.Resource.Name,
-                    server.Name,
-                    certificate.Location);
+                continue;
+            }
+
+            foreach (var file in new[] { certificate.Location, certificate.CertificateAuthority })
+            {
+                if (file is not null && !File.Exists(file))
+                {
+                    logger.LogWarning(
+                        "A certificate file of '{Resource}' for RavenDB server '{Server}' does not exist yet: {File}. Docker " +
+                        "Compose cannot start the application until it does.",
+                        consumer.Resource.Name,
+                        server.Name,
+                        file);
+                }
             }
         }
     }

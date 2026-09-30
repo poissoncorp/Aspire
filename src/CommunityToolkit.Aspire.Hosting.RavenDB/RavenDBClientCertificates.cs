@@ -23,7 +23,10 @@ internal enum RavenDBClientCertificateSource
 /// <param name="Server">The server the certificate is for.</param>
 /// <param name="Source">Where it comes from.</param>
 /// <param name="Location">The file path or the Secret name.</param>
-/// <param name="CertificateAuthority">The Secret with the server's certificate authority, for Kubernetes.</param>
+/// <param name="CertificateAuthority">
+/// The server's certificate authority, when it is not publicly trusted: a PEM file for Docker Compose, a Secret
+/// holding <c>ca.crt</c> for Kubernetes.
+/// </param>
 internal sealed record RavenDBClientCertificateAnnotation(
     RavenDBServerResource Server,
     RavenDBClientCertificateSource Source,
@@ -76,7 +79,13 @@ internal static class RavenDBComposeCertificates
     /// <param name="server">The server the certificate is for.</param>
     /// <param name="consumer">The application.</param>
     /// <param name="certificateFile">The .pfx file, as the compose file refers to it.</param>
-    public static void Mount(ComposeFile file, RavenDBServerResource server, RavenDBConsumer consumer, string certificateFile)
+    /// <param name="certificateAuthorityFile">The server's certificate authority, as the compose file refers to it, when it is private.</param>
+    public static void Mount(
+        ComposeFile file,
+        RavenDBServerResource server,
+        RavenDBConsumer consumer,
+        string certificateFile,
+        string? certificateAuthorityFile = null)
     {
         var (_, service) = file.Services
             .FirstOrDefault(s => string.Equals(s.Key, consumer.Resource.Name, StringComparison.OrdinalIgnoreCase));
@@ -99,5 +108,23 @@ internal static class RavenDBComposeCertificates
         {
             service.Environment[RavenDBConsumers.CertificatePathVariable(connectionName)] = $"/run/secrets/{target}";
         }
+
+        if (certificateAuthorityFile is null)
+        {
+            return;
+        }
+
+        // .NET on Linux reads its trusted roots from the directories in SSL_CERT_DIR: keep the image's own, and those
+        // of other servers the application uses, and add this server's certificate authority.
+        var authority = $"{secret}-authority";
+        var authorityDirectory = $"/ravendb/{server.Name.ToLowerInvariant()}-ca";
+
+        file.Secrets[authority] = new Secret { File = certificateAuthorityFile };
+        service.Secrets.RemoveAll(s => string.Equals(s.Source, authority, StringComparison.Ordinal));
+        service.Secrets.Add(new SecretReference { Source = authority, Target = $"{authorityDirectory}/ca.crt" });
+
+        service.Environment["SSL_CERT_DIR"] = service.Environment.TryGetValue("SSL_CERT_DIR", out var trusted) && trusted is { Length: > 0 }
+            ? $"{trusted}:{authorityDirectory}"
+            : $"/etc/ssl/certs:{authorityDirectory}";
     }
 }

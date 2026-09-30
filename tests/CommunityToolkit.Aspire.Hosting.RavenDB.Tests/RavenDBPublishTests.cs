@@ -272,6 +272,39 @@ public class RavenDBPublishTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task ComposePublishMountsThePrivateCertificateAuthorityOfTheServer()
+    {
+        using var tempDir = new TempDirectory();
+        using var builder = CreateForPublish(tempDir.Path);
+
+        builder.Configuration["Parameters:ravendb-url"] = "https://a.ravendb.example.com";
+        builder.AddDockerComposeEnvironment("compose");
+        var orders = builder.AddRavenDB("ravendb").PublishAsExisting(builder.AddParameter("ravendb-url")).AddDatabase("orders");
+
+        builder.AddContainer("consumer", "busybox")
+            .WithReference(orders)
+            .WithRavenDBClientCertificateFile(orders, "certs/consumer.pfx", "certs/ca.crt");
+
+        using var app = builder.Build();
+        await app.RunAsync(TestContext.Current.CancellationToken);
+
+        var yaml = new YamlStream();
+        yaml.Load(new StringReader(File.ReadAllText(Path.Combine(tempDir.Path, "docker-compose.yaml"))));
+        var compose = (YamlMappingNode)yaml.Documents[0].RootNode;
+
+        var authority = Path.GetFullPath("certs/ca.crt", builder.AppHostDirectory);
+        Assert.Equal(
+            Path.GetRelativePath(tempDir.Path, authority).Replace('\\', '/'),
+            compose["secrets"]["ravendb-ravendb--consumer-certificate-authority"]["file"].ToString());
+
+        // The application trusts the authority next to the image's own roots.
+        var consumer = (YamlMappingNode)compose["services"]["consumer"];
+        var targets = ((YamlSequenceNode)consumer["secrets"]).Select(s => s["target"].ToString()).ToList();
+        Assert.Contains("/ravendb/ravendb-ca/ca.crt", targets);
+        Assert.Equal("/etc/ssl/certs:/ravendb/ravendb-ca", consumer["environment"]["SSL_CERT_DIR"].ToString());
+    }
+
+    [Fact]
     public void ASecondCertificateForTheSameServerIsRejected()
     {
         using var builder = TestDistributedApplicationBuilder.Create();

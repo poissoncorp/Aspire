@@ -73,10 +73,10 @@ The server belongs to someone else, so its owner issues the applications' client
 ```csharp
 builder.AddProject<Projects.Api>("api")
     .WithReference(db)
-    .WithRavenDBClientCertificateFile(db, "certs/api.pfx"); // Docker Compose: mounted as a secret
+    .WithRavenDBClientCertificateFile(db, "certs/api.pfx", "certs/ca.crt"); // Docker Compose: mounted as secrets
 ```
 
-The file holds the application's private key: keep it out of source control.
+The optional second file is the certificate authority (PEM) that issued the server's certificate; pass it when that authority is not publicly trusted, and the application trusts it too. Docker Compose mounts the files with their permissions on the host, so the .pfx has to be readable by the user the container runs as (1654 for the .NET images). The .pfx holds the application's private key: keep it out of source control.
 
 In Kubernetes, `WithRavenDBClientCertificateSecret(db, "api-cert", "ravendb-ca")` from [CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes](https://www.nuget.org/packages/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes) mounts an existing Secret instead.
 

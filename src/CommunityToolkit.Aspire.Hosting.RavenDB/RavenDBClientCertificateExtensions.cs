@@ -23,24 +23,34 @@ public static class RavenDBClientCertificateExtensions
     /// A database of the server the certificate is for; the certificate serves every connection of the application to
     /// that server. The application references the database or the server.
     /// </param>
-    /// <param name="path">The .pfx file, without a password. A relative path is relative to the AppHost directory.</param>
+    /// <param name="path">
+    /// The .pfx file, without a password, readable by the user the application's container runs as. A relative path is
+    /// relative to the AppHost directory.
+    /// </param>
+    /// <param name="certificateAuthority">
+    /// The certificate authority (PEM) that issued the server's certificate, when it is not publicly trusted. The
+    /// application then trusts it as well. A relative path is relative to the AppHost directory.
+    /// </param>
     /// <returns>The <see cref="IResourceBuilder{T}"/> for the application.</returns>
     [AspireExport("withRavenDBDatabaseClientCertificateFile", MethodName = "withRavenDBClientCertificateFile")]
     public static IResourceBuilder<T> WithRavenDBClientCertificateFile<T>(
         this IResourceBuilder<T> builder,
         IResourceBuilder<RavenDBDatabaseResource> database,
-        string path)
+        string path,
+        string? certificateAuthority = null)
         where T : IComputeResource
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(database);
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
 
-        // Relative to the AppHost here; the compose file gets it relative to itself.
-        var file = Path.GetFullPath(path, builder.ApplicationBuilder.AppHostDirectory);
+        // Relative to the AppHost here; the compose file gets them relative to itself.
+        var appHost = builder.ApplicationBuilder.AppHostDirectory;
+        var file = Path.GetFullPath(path, appHost);
+        var authority = certificateAuthority is null ? null : Path.GetFullPath(certificateAuthority, appHost);
 
         return builder.WithAnnotation(RavenDBClientCertificates.Single(
             builder.Resource,
-            new RavenDBClientCertificateAnnotation(database.Resource.Parent, RavenDBClientCertificateSource.File, file)));
+            new RavenDBClientCertificateAnnotation(database.Resource.Parent, RavenDBClientCertificateSource.File, file, authority)));
     }
 }
