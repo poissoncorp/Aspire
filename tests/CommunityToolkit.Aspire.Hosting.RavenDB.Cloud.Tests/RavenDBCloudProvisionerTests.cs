@@ -24,7 +24,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
         await Provision(deployment);
 
         var request = Assert.Single(_api.CreateRequests);
-        Assert.Equal("ravendb-production", request["displayName"]!.GetValue<string>());
+        Assert.Equal("test-ravendb-production", request["displayName"]!.GetValue<string>());
         Assert.Equal("Aws", request["cloudProvider"]!.GetValue<string>());
         Assert.Equal("Development", request["tier"]!.GetValue<string>());
         Assert.Equal("DV10", request["instanceTypeName"]!.GetValue<string>());
@@ -32,9 +32,9 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
         Assert.Equal("Stable", request["releaseChannel"]!.GetValue<string>());
         Assert.Equal("SsdStandard", request["storageTypeName"]!.GetValue<string>());
         Assert.Equal("203.0.113.0/24", request["allowedIps"]![0]!.GetValue<string>());
-        Assert.Equal(RavenDBCloudDeployment.DeriveSubdomain("ravendb-production"), request["subdomainName"]!.GetValue<string>());
+        Assert.Equal(RavenDBCloudDeployment.DeriveSubdomain("test-ravendb-production"), request["subdomainName"]!.GetValue<string>());
 
-        Assert.Equal("https://a.ravendb-production.development.run", deployment.Endpoint.Url);
+        Assert.Equal("https://a.test-ravendb-production.development.run", deployment.Endpoint.Url);
         Assert.All(_api.ApiKeys, key => Assert.Equal("test-api-key", key));
 
         var section = _state[deployment.StateSectionName]!;
@@ -59,7 +59,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     [Fact]
     public async Task AdoptsAProductWithTheSameNameInsteadOfCreatingASecondOne()
     {
-        var existing = _api.AddProduct("ravendb-production");
+        var existing = _api.AddProduct("test-ravendb-production");
         existing.NodeTags = ["A", "B", "C"];
         var deployment = CreateDeployment(o => o.WithAllowedIps("203.0.113.0/24"));
 
@@ -99,20 +99,20 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     [Fact]
     public async Task TwoProductsWithTheSameNameAreRejected()
     {
-        _api.AddProduct("ravendb-production");
-        _api.AddProduct("ravendb-production");
+        _api.AddProduct("test-ravendb-production");
+        _api.AddProduct("test-ravendb-production");
         var deployment = CreateDeployment(o => o.WithAllowedIps("203.0.113.0/24"));
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => Provision(deployment));
 
-        Assert.Contains("2 RavenDB Cloud products named 'ravendb-production'", exception.Message);
+        Assert.Contains("2 RavenDB Cloud products named 'test-ravendb-production'", exception.Message);
     }
 
     [Fact]
     public async Task TerminatedProductWithTheSameNameDoesNotCount()
     {
-        _api.AddProduct("ravendb-production", status: "Terminated");
-        var live = _api.AddProduct("ravendb-production");
+        _api.AddProduct("test-ravendb-production", status: "Terminated");
+        var live = _api.AddProduct("test-ravendb-production");
         var deployment = CreateDeployment(o => o.WithAllowedIps("203.0.113.0/24"));
 
         await Provision(deployment);
@@ -124,7 +124,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     [Fact]
     public async Task ProductAwaitingPaymentFails()
     {
-        _api.AddProduct("ravendb-production", status: "AwaitingPayment");
+        _api.AddProduct("test-ravendb-production", status: "AwaitingPayment");
         var deployment = CreateDeployment();
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => Provision(deployment));
@@ -154,7 +154,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     [Fact]
     public async Task DestroyLeavesAnAdoptedProductRunning()
     {
-        _api.AddProduct("ravendb-production");
+        _api.AddProduct("test-ravendb-production");
         var deployment = CreateDeployment(o => o.TerminateOnDestroy = true);
         await Provision(deployment);
 
@@ -202,7 +202,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
 
         Assert.Equal(["orders", "reports"], _server.Databases.Order());
         var connection = Assert.Single(_server.Connections);
-        Assert.Equal("https://a.ravendb-production.development.run", connection.Url);
+        Assert.Equal("https://a.test-ravendb-production.development.run", connection.Url);
         Assert.Equal(RavenDBCloudProvisioner.GetThumbprint(_api.AdminCertificate), connection.CertificateThumbprint);
     }
 
@@ -340,7 +340,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
     [Fact]
     public async Task CertificatesNeedAnHttpsProduct()
     {
-        _api.AddProduct("ravendb-production").Dns = ["http://a.ravendb-production.development.run"];
+        _api.AddProduct("test-ravendb-production").Dns = ["http://a.test-ravendb-production.development.run"];
         var deployment = await ProvisionedDeployment();
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => IssueCertificates(deployment, Request("api", "orders")));
@@ -429,7 +429,7 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
         var options = new RavenDBCloudOptions();
         configure?.Invoke(options);
 
-        return new RavenDBCloudDeployment(server.Resource, apiKey.Resource, options, "Production")
+        return new RavenDBCloudDeployment(server.Resource, apiKey.Resource, options, "Test", "Production")
         {
             PollInterval = TimeSpan.FromMilliseconds(1),
         };

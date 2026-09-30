@@ -78,6 +78,7 @@ public static class RavenDBCloudBuilderExtensions
             builder.Resource,
             apiKey.Resource,
             options,
+            AppHostName(builder.ApplicationBuilder),
             builder.ApplicationBuilder.Environment.EnvironmentName);
 
         builder.ApplicationBuilder.Services.TryAddSingleton<IRavenDBCloudApiClientFactory, RavenDBCloudApiClientFactory>();
@@ -115,4 +116,11 @@ public static class RavenDBCloudBuilderExtensions
             .WithPipelineConfiguration(context => RavenDBCloudPipelineSteps.Configure(deployment, context))
             .ExcludeFromManifest();
     }
+
+    /// <summary>
+    /// The AppHost's directory: the project of a C# AppHost, the folder of a TypeScript one, whose process is always
+    /// named aspire-managed. It is the same on every machine that checks the repository out.
+    /// </summary>
+    private static string AppHostName(IDistributedApplicationBuilder builder) =>
+        Path.GetFileName(Path.TrimEndingDirectorySeparator(builder.AppHostDirectory));
 }

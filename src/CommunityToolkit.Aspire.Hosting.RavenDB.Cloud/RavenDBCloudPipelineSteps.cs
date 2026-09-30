@@ -2,7 +2,6 @@ using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Docker;
 using Aspire.Hosting.Pipelines;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud;
@@ -198,7 +197,7 @@ internal static class RavenDBCloudPipelineSteps
         }
 
         var outputService = context.Services.GetRequiredService<IPipelineOutputService>();
-        var environmentName = context.Services.GetService<IHostEnvironment>()?.EnvironmentName ?? "Production";
+        var environmentName = deployment.EnvironmentName;
         var key = ToEnvironmentVariableName(deployment.Endpoint.ValueExpression);
 
         foreach (var environment in environments)
@@ -257,8 +256,7 @@ internal static class RavenDBCloudPipelineSteps
         var server = deployment.Server;
         var environments = context.Model.Resources.OfType<IComputeEnvironmentResource>().ToList();
         var outputService = context.Services.GetRequiredService<IPipelineOutputService>();
-        var host = context.Services.GetService<IHostEnvironment>();
-        var prefix = RavenDBCloudClientCertificates.NamePrefix(host?.ApplicationName ?? "apphost", host?.EnvironmentName ?? "Production");
+        var prefix = RavenDBCloudClientCertificates.NamePrefix(deployment.AppHostName, deployment.EnvironmentName);
 
         string DirectoryOf(IComputeEnvironmentResource environment) =>
             Path.Combine(RavenDBPublishing.OutputDirectory(outputService, environment, environments.Count), RavenDBCloudClientCertificates.DirectoryName);

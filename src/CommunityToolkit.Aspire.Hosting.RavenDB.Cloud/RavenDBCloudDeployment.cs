@@ -10,12 +10,22 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud;
 /// </summary>
 internal sealed class RavenDBCloudDeployment : IResourceAnnotation
 {
-    public RavenDBCloudDeployment(RavenDBServerResource server, ParameterResource apiKey, RavenDBCloudOptions options, string environmentName)
+    public RavenDBCloudDeployment(
+        RavenDBServerResource server,
+        ParameterResource apiKey,
+        RavenDBCloudOptions options,
+        string appHostName,
+        string environmentName)
     {
         Server = server;
         ApiKey = apiKey;
         Options = options;
-        ProductName = options.ProductName ?? $"{server.Name}-{environmentName}".ToLowerInvariant();
+        AppHostName = appHostName;
+        EnvironmentName = environmentName;
+
+        // Named after the AppHost too: two AppHosts in one account, both with AddRavenDB("ravendb"), must not
+        // share a product and its databases.
+        ProductName = options.ProductName ?? $"{appHostName}-{server.Name}-{environmentName}".Replace('.', '-').ToLowerInvariant();
         Subdomain = options.Subdomain ?? DeriveSubdomain(ProductName);
         Endpoint = new RavenDBCloudEndpoint(server.Name);
     }
@@ -28,6 +38,12 @@ internal sealed class RavenDBCloudDeployment : IResourceAnnotation
     public ParameterResource ApiKey { get; }
 
     public RavenDBCloudOptions Options { get; }
+
+    /// <summary>The AppHost the product and the applications' certificates are named after.</summary>
+    public string AppHostName { get; }
+
+    /// <summary>The environment the product and the applications' certificates are named after.</summary>
+    public string EnvironmentName { get; }
 
     /// <summary>Display name the product is looked up and created by.</summary>
     public string ProductName { get; }

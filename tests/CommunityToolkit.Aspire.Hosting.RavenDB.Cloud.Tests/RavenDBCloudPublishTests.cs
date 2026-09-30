@@ -187,11 +187,12 @@ public class RavenDBCloudPublishTests
     }
 
     [Fact]
-    public void ProductNameDefaultsToResourceAndEnvironment()
+    public void ProductNameDefaultsToAppHostResourceAndEnvironment()
     {
         var deployment = CreateDeployment("Staging");
 
-        Assert.Equal("ravendb-staging", deployment.ProductName);
+        // Two AppHosts in one account, both with AddRavenDB("ravendb"), get products of their own.
+        Assert.Equal("contoso-apphost-ravendb-staging", deployment.ProductName);
         Assert.Equal("RAVENDB_URL", RavenDBCloudPipelineSteps.ToEnvironmentVariableName(deployment.Endpoint.ValueExpression));
     }
 
@@ -207,7 +208,7 @@ public class RavenDBCloudPublishTests
         var staging = CreateDeployment("Staging").Subdomain;
         var production = CreateDeployment("Production").Subdomain;
 
-        Assert.StartsWith("ravendb-", production);
+        Assert.StartsWith("contoso-", production);
         Assert.Equal(RavenDBCloudDeployment.MaxSubdomainLength, production.Length);
         Assert.True(RavenDBCloudDeployment.IsValidSubdomain(production));
         Assert.NotEqual(staging, production);
@@ -340,6 +341,7 @@ public class RavenDBCloudPublishTests
             server.Resource,
             builder.AddParameter("ravendb-cloud-api-key", secret: true).Resource,
             new RavenDBCloudOptions(),
+            "Contoso.AppHost",
             environmentName);
     }
 }

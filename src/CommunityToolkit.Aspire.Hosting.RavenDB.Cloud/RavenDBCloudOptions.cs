@@ -51,8 +51,9 @@ public enum RavenDBCloudStorageType
 public sealed class RavenDBCloudOptions
 {
     /// <summary>
-    /// Display name of the product in the account. Defaults to <c>&lt;resource name&gt;-&lt;environment&gt;</c>, so
-    /// staging and production get different products.
+    /// Display name of the product in the account. Defaults to
+    /// <c>&lt;AppHost&gt;-&lt;resource name&gt;-&lt;environment&gt;</c>, so every AppHost and every environment get a product
+    /// of their own.
     /// </summary>
     public string? ProductName { get; set; }
 
