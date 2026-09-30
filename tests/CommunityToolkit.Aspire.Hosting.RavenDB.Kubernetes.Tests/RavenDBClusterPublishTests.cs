@@ -441,6 +441,40 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task DataVolumesTakeTheStorageClassOfTheEnvironmentUnlessTheClusterSetsOne()
+    {
+        using (var chart = await Publish(
+            builder =>
+            {
+                builder.AddKubernetesEnvironment("k8s").Resource.DefaultStorageClassName = "standard-ssd";
+                AddCluster(builder);
+            },
+            addEnvironment: false))
+        {
+            var data = chart.Single("RavenDBCluster").Get("spec", "storage", "data");
+            Assert.Equal("standard-ssd", data.Scalar("storageClassName"));
+            Assert.Equal("10Gi", data.Scalar("size"));
+        }
+
+        using (var chart = await Publish(
+            builder =>
+            {
+                builder.AddKubernetesEnvironment("k8s").Resource.DefaultStorageClassName = "standard-ssd";
+                AddCluster(builder, cluster =>
+                {
+                    cluster.StorageClassName = "premium-ssd";
+                    cluster.StorageSize = "50Gi";
+                });
+            },
+            addEnvironment: false))
+        {
+            var data = chart.Single("RavenDBCluster").Get("spec", "storage", "data");
+            Assert.Equal("premium-ssd", data.Scalar("storageClassName"));
+            Assert.Equal("50Gi", data.Scalar("size"));
+        }
+    }
+
+    [Fact]
     public void RunModeKeepsTheLocalContainer()
     {
         using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Run);
@@ -465,6 +499,7 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         var watch = Assert.Single(steps, s => s.Name == "ravendb-cluster-watch-ravendb");
         var wait = Assert.Single(steps, s => s.Name == "ravendb-cluster-wait-ravendb");
         var reset = Assert.Single(steps, s => s.Name == "ravendb-cluster-reset-ravendb");
+        var check = Assert.Single(steps, s => s.Name == "ravendb-cluster-check-ravendb");
         var writeChart = new PipelineStep { Name = "publish-k8s", Action = _ => Task.CompletedTask };
         var prepareHelm = new PipelineStep { Name = "prepare-k8s", Action = _ => Task.CompletedTask };
         var helm = new PipelineStep { Name = "helm-deploy-k8s", Action = _ => Task.CompletedTask };
@@ -491,7 +526,18 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         // A bootstrap Job that failed is deleted before Helm, which then creates it again.
         Assert.Contains("ravendb-cluster-reset-ravendb", helm.DependsOnSteps);
         Assert.Contains("prepare-k8s", reset.DependsOnSteps);
+
+        // A missing operator is reported before Helm fails on the RavenDBCluster.
+        Assert.Contains("ravendb-cluster-check-ravendb", helm.DependsOnSteps);
+        Assert.Contains(WellKnownPipelineSteps.DeployPrereq, check.DependsOnSteps);
     }
+
+    [Theory]
+    [InlineData("error: the server doesn't have a resource type \"ravendbclusters\"", true)]
+    [InlineData("Error from server (Forbidden): ravendbclusters.ravendb.ravendb.io is forbidden", false)]
+    [InlineData("Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused", false)]
+    public void OnlyAMissingResourceTypeMeansTheOperatorIsNotInstalled(string kubectlError, bool missing) =>
+        Assert.Equal(missing, RavenDBClusterPipelineSteps.IsUnknownResourceType(kubectlError));
 
     [Fact]
     public void ScriptSurvivesHelmAndLinux()

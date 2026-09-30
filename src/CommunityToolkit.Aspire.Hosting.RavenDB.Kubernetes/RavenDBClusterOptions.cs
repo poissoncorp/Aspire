@@ -31,12 +31,14 @@ public sealed class RavenDBClusterOptions
     public string? Image { get; set; }
 
     /// <summary>
-    /// Gets or sets the size of each node's data volume. The default is <c>10Gi</c>.
+    /// Gets or sets the size of each node's data volume. The default is <c>10Gi</c>; the Kubernetes environment's
+    /// <c>DefaultStorageSize</c>, meant for small volumes, does not apply.
     /// </summary>
     public string StorageSize { get; set; } = "10Gi";
 
     /// <summary>
-    /// Gets or sets the storage class of the data volumes. The default is the cluster's default storage class.
+    /// Gets or sets the storage class of the data volumes. The default is the Kubernetes environment's
+    /// <c>DefaultStorageClassName</c>, and without one the cluster's default storage class.
     /// </summary>
     public string? StorageClassName { get; set; }
 

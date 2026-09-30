@@ -10,7 +10,8 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes;
 
 /// <summary>
 /// The steps of a server published to Kubernetes: once the chart is written, drop the bootstrap Jobs of earlier
-/// configurations from it; before Helm, delete a bootstrap Job that failed, so that it runs again; while Helm installs
+/// configurations from it; before Helm, check that the operator is installed and delete a bootstrap Job that failed,
+/// so that it runs again; while Helm installs
 /// the chart, report what keeps the cluster or the bootstrap from getting ready; after Helm, wait until the bootstrap
 /// Job has created the databases and the applications' certificates. The Job itself waits for the operator.
 /// </summary>
@@ -23,6 +24,11 @@ internal static partial class RavenDBClusterPipelineSteps
     public static string WaitStepName(RavenDBServerResource server) => $"ravendb-cluster-wait-{server.Name}";
 
     public static string ResetStepName(RavenDBServerResource server) => $"ravendb-cluster-reset-{server.Name}";
+
+    public static string CheckStepName(RavenDBServerResource server) => $"ravendb-cluster-check-{server.Name}";
+
+    /// <summary>The operator's cluster type, fully qualified so that no other operator's RavenDBCluster answers.</summary>
+    private const string ClusterResourceType = "ravendbclusters.ravendb.ravendb.io";
 
     private static readonly TimeSpan s_timeout = TimeSpan.FromMinutes(20);
 
@@ -64,6 +70,18 @@ internal static partial class RavenDBClusterPipelineSteps
         watch.RequiredBy(WellKnownPipelineSteps.Deploy);
         yield return watch;
 
+        var check = new PipelineStep
+        {
+            Name = CheckStepName(deployment.Server),
+            Description = $"Checks that the RavenDB operator is installed in the Kubernetes cluster of '{deployment.Server.Name}'",
+            Resource = deployment.Server,
+            Action = EnsureOperatorInstalledAsync,
+        };
+
+        check.DependsOn(WellKnownPipelineSteps.DeployPrereq);
+        check.RequiredBy(WellKnownPipelineSteps.Deploy);
+        yield return check;
+
         var reset = new PipelineStep
         {
             Name = ResetStepName(deployment.Server),
@@ -94,6 +112,7 @@ internal static partial class RavenDBClusterPipelineSteps
         var watch = context.Steps.FirstOrDefault(s => s.Name == WatchStepName(deployment.Server));
         var wait = context.Steps.FirstOrDefault(s => s.Name == WaitStepName(deployment.Server));
         var reset = context.Steps.FirstOrDefault(s => s.Name == ResetStepName(deployment.Server));
+        var check = context.Steps.FirstOrDefault(s => s.Name == CheckStepName(deployment.Server));
 
         foreach (var environment in context.Model.Resources.OfType<KubernetesEnvironmentResource>())
         {
@@ -121,6 +140,11 @@ internal static partial class RavenDBClusterPipelineSteps
                 if (reset is not null)
                 {
                     helm.DependsOn(reset);
+                }
+
+                if (check is not null)
+                {
+                    helm.DependsOn(check);
                 }
             }
         }
@@ -259,6 +283,32 @@ internal static partial class RavenDBClusterPipelineSteps
     }
 
     /// <summary>
+    /// Without the operator, Helm fails on the chart's <c>RavenDBCluster</c> with a message that names neither the
+    /// operator nor how to install it. Any other failure to ask is left to Helm, which reports it itself.
+    /// </summary>
+    private static async Task EnsureOperatorInstalledAsync(PipelineStepContext context)
+    {
+        if (context.Model.Resources.OfType<KubernetesEnvironmentResource>().FirstOrDefault() is not { } environment)
+        {
+            return;
+        }
+
+        var kubectl = await Kubectl.CreateAsync(environment, context.CancellationToken).ConfigureAwait(false);
+        var result = await kubectl.TryRunAsync(["get", ClusterResourceType, "--output=name"], context.CancellationToken).ConfigureAwait(false);
+
+        if (result.ExitCode != 0 && IsUnknownResourceType(result.Error))
+        {
+            throw new InvalidOperationException(
+                "The RavenDB operator is not installed in the Kubernetes cluster: it has no RavenDBCluster resource type. " +
+                "Install cert-manager and the operator once per cluster, as the Prerequisites of " +
+                "https://www.nuget.org/packages/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes show.");
+        }
+    }
+
+    internal static bool IsUnknownResourceType(string kubectlError) =>
+        kubectlError.Contains("the server doesn't have a resource type", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
     /// The Job is named after its configuration, so a deployment that fixes what made it fail (DNS, a Secret) renders
     /// the same Job, which Helm leaves as it is. Deleted, it is created again and runs anew.
     /// </summary>
@@ -367,6 +417,18 @@ internal static partial class RavenDBClusterPipelineSteps
 
         public async Task<string> RunAsync(IReadOnlyList<string> arguments, CancellationToken cancellationToken, bool throwOnError = true)
         {
+            var result = await TryRunAsync(arguments, cancellationToken).ConfigureAwait(false);
+
+            if (result.ExitCode != 0 && throwOnError)
+            {
+                throw new InvalidOperationException($"kubectl {string.Join(' ', arguments)} failed: {result.Error.Trim()}");
+            }
+
+            return result.Output;
+        }
+
+        public async Task<(int ExitCode, string Output, string Error)> TryRunAsync(IReadOnlyList<string> arguments, CancellationToken cancellationToken)
+        {
             var start = new ProcessStartInfo("kubectl")
             {
                 RedirectStandardOutput = true,
@@ -395,12 +457,7 @@ internal static partial class RavenDBClusterPipelineSteps
                 throw;
             }
 
-            if (process.ExitCode != 0 && throwOnError)
-            {
-                throw new InvalidOperationException($"kubectl {string.Join(' ', arguments)} failed: {(await error.ConfigureAwait(false)).Trim()}");
-            }
-
-            return await output.ConfigureAwait(false);
+            return (process.ExitCode, await output.ConfigureAwait(false), await error.ConfigureAwait(false));
         }
     }
 }

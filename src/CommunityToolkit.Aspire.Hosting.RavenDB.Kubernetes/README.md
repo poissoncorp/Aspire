@@ -9,7 +9,7 @@ Deploys the [RavenDB hosting integration](https://www.nuget.org/packages/Communi
 - Helm 4 on the machine that runs `aspire deploy`: Aspire's Kubernetes deployment installs the chart with it.
 - The RavenDB operator, with cert-manager, installed once per Kubernetes cluster (see below).
 - An ingress controller the operator can publish the nodes through (`nginx`, `traefik` or `haproxy`). Traefik does not pass TLS through for the operator's Ingress, so for `traefik` the chart adds an `IngressRouteTCP` that does, on the `websecure` entry point: Traefik needs its Kubernetes CRD provider enabled and `websecure` exposed on port 443.
-- DNS for the nodes, inside the cluster as well, before the nodes start: node `a` is `https://a.<domain>:443`, and the operator's own bootstrap and the applications connect through those names. Each node checks its own URL once when it starts; with a private certificate authority, nodes that could not reach themselves reject each other until they restart.
+- DNS for the nodes, inside the cluster as well, before the nodes start: node `a` is `https://a.<domain>:443`, and the operator's own bootstrap and the applications connect through those names. Each node checks its own URL once when it starts; with a private certificate authority, nodes that could not reach themselves reject each other until they restart (the bootstrap Job says so after three minutes). Once DNS resolves the nodes, restart them with `kubectl delete pod --namespace <namespace> -l nodeTag`; if the operator's `ravendb-cluster-init` Job has failed meanwhile, delete it as well (only a failed one), so that the operator runs it again. Then run `aspire deploy` again.
 - Secrets in the target namespace, created the way the operator documents them:
 
 ```bash
@@ -28,6 +28,8 @@ Install cert-manager and the operator outside the AppHost, once per Kubernetes c
 helm install cert-manager oci://quay.io/jetstack/charts/cert-manager --version v1.21.2 -n cert-manager --create-namespace --set crds.enabled=true
 helm install ravendb-operator ravendb-operator --repo https://ravendb.github.io/ravendb-operator/helm --version 2.0.0 -n ravendb-operator-system --create-namespace
 ```
+
+`aspire deploy` checks for the operator before Helm runs, and stops with a pointer here when it is missing.
 
 ### Install the package
 
@@ -66,6 +68,8 @@ The chart then contains, next to the application:
 
 `aspire deploy` installs the chart and waits for the bootstrap Job to complete. The operator only runs pinned images, so set `Image` (or `WithImageTag(...)`) to a concrete tag. It runs one cluster per namespace.
 
+Each node keeps its data on a persistent volume of `StorageSize` (`10Gi` by default) and `StorageClassName`, by default the Kubernetes environment's `DefaultStorageClassName`, else the cluster's default storage class. The environment's `DefaultStorageType` and `DefaultStorageSize` do not apply: a database always gets a persistent volume, sized for a database. Both settings take effect when the cluster is created: a StatefulSet keeps its volume templates, so changing them later changes nothing, and neither the operator nor Kubernetes reports it. Resize the volumes themselves where their storage class allows it.
+
 Helm waits for the whole chart, the `RavenDBCluster` included, for five minutes; Aspire does not offer a longer timeout. When the operator puts the cluster in its Error phase, or a bootstrap attempt fails, the deployment logs the reasons right away instead of leaving you with Helm's timeout. A cluster that is still starting when Helm gives up keeps starting: run `aspire deploy` again.
 
 To let the operator obtain the certificates from Let's Encrypt instead, use `cluster.WithLetsEncrypt("ops@example.com", "ravendb-admin")` with a public domain.
@@ -102,13 +106,17 @@ builder.AddProject<Projects.Api>("api")
 
 `api-cert` holds the application's certificate under `client.pfx`, and the optional `ravendb-ca` the server's certificate authority under `ca.crt`. An application of a cluster published with `PublishAsRavenDBCluster` can bring its certificate the same way; the bootstrap then issues it none.
 
+### Changing the AppHost
+
+Aspire writes the chart into the same directory (`aspire-output` by default) on every publish and deploy, and does not delete what earlier runs wrote there. The integration cleans up after itself: the bootstrap Job gets a new name whenever its configuration changes, and the Jobs of earlier configurations are removed from the chart, so changing the cluster, its databases or its applications needs no clean-up. Removing a resource from the AppHost is up to Aspire: its templates stay in the chart, and Helm keeps deploying it. After removing a resource, delete the chart directory before the next `aspire deploy`.
+
 ### Destroy
 
 `aspire destroy` uninstalls the chart. The operator removes the cluster; the data volumes stay, as with every StatefulSet.
 
 The RavenDB operator (2.0.0) cannot start a cluster again on the volumes of a removed one: its initialization Job fails on nodes that already form a cluster, and the cluster stays in its Error phase. Delete its volumes, `ravendb-data-ravendb-<tag>-0`, before deploying again; this deletes the data.
 
-`aspire destroy` only knows about deployments that completed: after a first `aspire deploy` that failed, uninstall the release with `helm uninstall`.
+`aspire destroy` only knows about deployments that completed: Aspire records the Helm release once `helm upgrade` succeeds. After a first `aspire deploy` that failed, uninstall the release yourself with `helm uninstall <release> --namespace <namespace>`. The release is named after the environment deployed (`production` for `aspire deploy` without `--environment`), unless the AppHost names it with `WithHelm(helm => helm.WithReleaseName(...))`.
 
 ## Feedback & contributing
 

@@ -300,7 +300,7 @@ internal static partial class RavenDBClusterPublishing
         k8s.AdditionalResources.Add(script);
 
         k8s.AdditionalResources.AddRange(CreateAccess(deployment));
-        k8s.AdditionalResources.Add(CreateCluster(deployment));
+        k8s.AdditionalResources.Add(CreateCluster(deployment, k8s.Parent));
 
         if (deployment.Options.IngressClassName == "traefik")
         {
@@ -313,7 +313,7 @@ internal static partial class RavenDBClusterPublishing
         }
     }
 
-    private static RavenDBClusterManifest CreateCluster(RavenDBClusterDeployment deployment)
+    private static RavenDBClusterManifest CreateCluster(RavenDBClusterDeployment deployment, KubernetesEnvironmentResource environment)
     {
         var options = deployment.Options;
 
@@ -335,7 +335,7 @@ internal static partial class RavenDBClusterPublishing
                     PublicServerUrl = deployment.NodeUrls[i],
                     PublicServerUrlTcp = $"tcp://{deployment.NodeTcpHost(i)}:443",
                 })],
-                Storage = { Data = { Size = options.StorageSize, StorageClassName = options.StorageClassName } },
+                Storage = { Data = { Size = options.StorageSize, StorageClassName = options.StorageClassName ?? environment.DefaultStorageClassName } },
                 ExternalAccessConfiguration = { IngressControllerContext = { IngressClassName = options.IngressClassName } },
             },
         };

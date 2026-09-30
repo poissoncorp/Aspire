@@ -57,6 +57,7 @@ read -r -a URLS <<< "$RAVENDB_URLS"
 LEADER="${URLS[0]}"
 
 wait_for_cluster() {
+    local hinted=""
     for attempt in $(seq 1 90); do
         if topology=$("${RAVEN[@]}" -f "$LEADER/cluster/topology" 2>/dev/null); then
             missing=""
@@ -70,6 +71,14 @@ wait_for_cluster() {
             fi
 
             log "Waiting for nodes to join the cluster:$missing (attempt $attempt)"
+
+            # A node checks its own URL once when it starts: with a private certificate authority, one that could not
+            # reach itself then (DNS not ready yet) rejects the others until it restarts.
+            if [[ $attempt -ge 18 && -z "$hinted" ]]; then
+                hinted=1
+                log "Nodes that have not joined after 3 minutes may have started before DNS resolved their names." \
+                    "Once it does, restart them: kubectl delete pod --namespace $NAMESPACE -l nodeTag"
+            fi
         else
             log "Waiting for RavenDB at $LEADER to accept the admin certificate (attempt $attempt)"
         fi
