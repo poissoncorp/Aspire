@@ -16,8 +16,12 @@ namespace Aspire.Hosting
 
     public static partial class RavenDBKubernetesClientCertificateExtensions
     {
-        [AspireExport("withRavenDBDatabaseClientCertificateSecret", MethodName = "withRavenDBClientCertificateSecret")]
+        [AspireExportIgnore(Reason = "Polyglot app hosts pass the server: ATS allows one export per member name and target type.")]
         public static ApplicationModel.IResourceBuilder<T> WithRavenDBClientCertificateSecret<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBDatabaseResource> database, string secretName, string? certificateAuthoritySecret = null)
+            where T : ApplicationModel.IComputeResource { throw null; }
+
+        [AspireExport("withRavenDBServerClientCertificateSecret", MethodName = "withRavenDBClientCertificateSecret")]
+        public static ApplicationModel.IResourceBuilder<T> WithRavenDBClientCertificateSecret<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> server, string secretName, string? certificateAuthoritySecret = null)
             where T : ApplicationModel.IComputeResource { throw null; }
     }
 }
@@ -31,7 +35,7 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes
 
         public string? Image { get { throw null; } set { } }
 
-        public string IngressClassName { get { throw null; } set { } }
+        public RavenDBIngressController IngressController { get { throw null; } set { } }
 
         public string? LicenseSecretName { get { throw null; } set { } }
 
@@ -44,5 +48,12 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes
         public RavenDBClusterOptions WithCertificates(string serverCertificateSecret, string clientCertificateSecret, string? certificateAuthoritySecret = null) { throw null; }
 
         public RavenDBClusterOptions WithLetsEncrypt(string email, string clientCertificateSecret) { throw null; }
+    }
+
+    public enum RavenDBIngressController
+    {
+        Traefik = 0,
+        HAProxy = 1,
+        Nginx = 2
     }
 }

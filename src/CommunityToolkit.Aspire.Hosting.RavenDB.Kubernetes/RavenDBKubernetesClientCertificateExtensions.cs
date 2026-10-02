@@ -4,6 +4,7 @@ using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Kubernetes;
 using CommunityToolkit.Aspire.Hosting.RavenDB;
 using CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes;
+using CommunityToolkit.Aspire.Utils;
 
 namespace Aspire.Hosting;
 
@@ -22,9 +23,9 @@ public static class RavenDBKubernetesClientCertificateExtensions
     /// </summary>
     /// <typeparam name="T">The application resource.</typeparam>
     /// <param name="builder">The resource builder for the application.</param>
-    /// <param name="database">
-    /// A database of the server the certificate is for; the certificate serves every connection of the application to
-    /// that server. The application references the database or the server.
+    /// <param name="server">
+    /// The server the certificate is for; it serves every connection of the application to that server. The
+    /// application references the server or one of its databases.
     /// </param>
     /// <param name="secretName">Existing Secret with the certificate, without a password, under the key <c>client.pfx</c>.</param>
     /// <param name="certificateAuthoritySecret">
@@ -32,7 +33,28 @@ public static class RavenDBKubernetesClientCertificateExtensions
     /// not publicly trusted. The application trusts it next to the image's own roots.
     /// </param>
     /// <returns>The <see cref="IResourceBuilder{T}"/> for the application.</returns>
-    [AspireExport("withRavenDBDatabaseClientCertificateSecret", MethodName = "withRavenDBClientCertificateSecret")]
+    [AspireExport("withRavenDBServerClientCertificateSecret", MethodName = "withRavenDBClientCertificateSecret")]
+    public static IResourceBuilder<T> WithRavenDBClientCertificateSecret<T>(
+        this IResourceBuilder<T> builder,
+        IResourceBuilder<RavenDBServerResource> server,
+        string secretName,
+        string? certificateAuthoritySecret = null)
+        where T : IComputeResource
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(server);
+        ArgumentException.ThrowIfNullOrWhiteSpace(secretName);
+        MatchingPackageVersion.Ensure(typeof(RavenDBServerResource), typeof(RavenDBClusterOptions));
+
+        return builder.WithClientCertificateSecret(server.Resource, secretName, certificateAuthoritySecret);
+    }
+
+    /// <inheritdoc cref="WithRavenDBClientCertificateSecret{T}(IResourceBuilder{T}, IResourceBuilder{RavenDBServerResource}, string, string?)"/>
+    /// <param name="builder">The resource builder for the application.</param>
+    /// <param name="database">A database of the server the certificate is for.</param>
+    /// <param name="secretName">Existing Secret with the certificate under the key <c>client.pfx</c>.</param>
+    /// <param name="certificateAuthoritySecret">Existing Secret with the server's certificate authority under the key <c>ca.crt</c>.</param>
+    [AspireExportIgnore(Reason = "Polyglot app hosts pass the server: ATS allows one export per member name and target type.")]
     public static IResourceBuilder<T> WithRavenDBClientCertificateSecret<T>(
         this IResourceBuilder<T> builder,
         IResourceBuilder<RavenDBDatabaseResource> database,
@@ -43,8 +65,18 @@ public static class RavenDBKubernetesClientCertificateExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(database);
         ArgumentException.ThrowIfNullOrWhiteSpace(secretName);
+        MatchingPackageVersion.Ensure(typeof(RavenDBServerResource), typeof(RavenDBClusterOptions));
 
-        var server = database.Resource.Parent;
+        return builder.WithClientCertificateSecret(database.Resource.Parent, secretName, certificateAuthoritySecret);
+    }
+
+    private static IResourceBuilder<T> WithClientCertificateSecret<T>(
+        this IResourceBuilder<T> builder,
+        RavenDBServerResource server,
+        string secretName,
+        string? certificateAuthoritySecret)
+        where T : IComputeResource
+    {
         builder.WithAnnotation(RavenDBClientCertificates.Single(
             builder.Resource,
             new RavenDBClientCertificateAnnotation(server, RavenDBClientCertificateSource.KubernetesSecret, secretName, certificateAuthoritySecret)));

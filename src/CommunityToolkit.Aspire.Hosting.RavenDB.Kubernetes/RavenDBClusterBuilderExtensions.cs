@@ -3,6 +3,7 @@
 using System.Text.RegularExpressions;
 using Aspire.Hosting.ApplicationModel;
 using CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes;
+using CommunityToolkit.Aspire.Utils;
 
 namespace Aspire.Hosting;
 
@@ -38,6 +39,7 @@ public static partial class RavenDBClusterBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(configure);
+        MatchingPackageVersion.Ensure(typeof(RavenDBServerResource), typeof(RavenDBClusterOptions));
 
         var options = new RavenDBClusterOptions();
         configure(options);
@@ -62,11 +64,10 @@ public static partial class RavenDBClusterBuilderExtensions
             throw new ArgumentException("A RavenDB cluster has 1 to 26 nodes.", nameof(configure));
         }
 
-        // The operator's RavenDBCluster definition accepts these three only.
-        if (options.IngressClassName is not ("traefik" or "haproxy" or "nginx"))
+        if (!Enum.IsDefined(options.IngressController))
         {
             throw new ArgumentException(
-                $"The RavenDB operator publishes the nodes through traefik, haproxy or nginx, not '{options.IngressClassName}'.",
+                $"The RavenDB operator publishes the nodes through Traefik, HAProxy or ingress-nginx, not '{options.IngressController}'.",
                 nameof(configure));
         }
 

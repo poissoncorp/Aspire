@@ -4,6 +4,25 @@ using Aspire.Hosting;
 
 namespace CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes;
 
+/// <summary>The ingress controller the RavenDB operator publishes the nodes through.</summary>
+public enum RavenDBIngressController
+{
+    /// <summary>
+    /// Traefik, the recommended one: the chart adds the routes that pass TLS through to each node, on Traefik's
+    /// <c>websecure</c> entry point, so nothing has to be set up for the nodes' HTTPS and TCP addresses.
+    /// </summary>
+    Traefik,
+
+    /// <summary>HAProxy Ingress. The chart only names it: the controller has to pass TLS through to the nodes.</summary>
+    HAProxy,
+
+    /// <summary>
+    /// ingress-nginx, which Kubernetes has retired. The chart only names it: the controller has to pass TLS through to
+    /// the nodes (<c>--enable-ssl-passthrough</c>).
+    /// </summary>
+    Nginx,
+}
+
 /// <summary>
 /// Describes the <c>RavenDBCluster</c> the RavenDB operator runs for a server published to Kubernetes.
 /// </summary>
@@ -43,12 +62,11 @@ public sealed class RavenDBClusterOptions
     public string? StorageClassName { get; set; }
 
     /// <summary>
-    /// Gets or sets the ingress controller the operator publishes the nodes through: <c>traefik</c>, <c>haproxy</c>
-    /// or <c>nginx</c>. The default is <c>traefik</c>, for which the chart also gets the routes that pass TLS through
-    /// to the nodes, on Traefik's <c>websecure</c> entry point. <c>nginx</c> is ingress-nginx, which receives no
-    /// fixes since March 2026.
+    /// Gets or sets the ingress controller the operator publishes the nodes through. The default and recommended one
+    /// is <see cref="RavenDBIngressController.Traefik"/>, for which the chart also gets the routes that pass TLS
+    /// through to the nodes.
     /// </summary>
-    public string IngressClassName { get; set; } = "traefik";
+    public RavenDBIngressController IngressController { get; set; } = RavenDBIngressController.Traefik;
 
     /// <summary>
     /// Gets or sets the name of an existing Secret that holds the license under the key <c>license.json</c>. Not

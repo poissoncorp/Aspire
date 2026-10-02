@@ -24,20 +24,20 @@ public sealed class BootstrapScriptTests : IDisposable
         .Mount($"{ServiceAccount}/ca.crt", "ca")
         .Mount("/ravendb/admin/client.pfx", CreateCertificate("admin").Pfx)
         .Mount("/ravendb/bootstrap/bootstrap.sh", RavenDBClusterPublishing.Script)
-        .Respond("GET", $"{Kubernetes}/serviceaccounts/ravendb-bootstrap", 200, """{"metadata":{"uid":"owner-uid"}}""")
         .Respond("GET", $"{Leader}/cluster/topology", 200, """{"Topology":{"Members":{"A":"https://a.shop.test","B":"https://b.shop.test"}}}""");
 
     public void Dispose() => _harness.Dispose();
 
     [Fact]
-    public async Task NewApplicationGetsACertificateForItsDatabasesInASecretTheChartOwns()
+    public async Task NewApplicationGetsACertificateForItsDatabasesInTheSecretTheChartCreated()
     {
         _harness
             .Respond("PUT", $"{Leader}/admin/databases?name=orders&replicationFactor=2", 201)
+            .Respond("GET", $"{Kubernetes}/secrets/api", 200, Secret(pfx: null))
             .Respond("PUT", $"{Leader}/admin/certificates", 201)
             .Respond("GET", $"{Leader}/admin/certificates?start=0&*", 200, Certificates(("0123", "aspire.shop.worker"), ("4567", "orders-team")))
             .Respond("DELETE", $"{Leader}/admin/certificates?thumbprint=*", 204)
-            .Respond("POST", $"{Kubernetes}/secrets", 201);
+            .Respond("PATCH", $"{Kubernetes}/secrets/api", 200);
 
         var result = await Run();
 
@@ -49,11 +49,9 @@ public sealed class BootstrapScriptTests : IDisposable
         Assert.Equal("ValidUser", registered["SecurityClearance"]!.GetValue<string>());
         Assert.Equal("""{"orders":"ReadWrite"}""", registered["Permissions"]!.ToJsonString());
 
-        // The Secret holds the registered certificate, and the chart's ServiceAccount owns it.
-        var secret = Body(Single("POST", "/secrets"));
-        Assert.Equal("api", secret["metadata"]!["name"]!.GetValue<string>());
-        Assert.Equal("owner-uid", secret["metadata"]!["ownerReferences"]![0]!["uid"]!.GetValue<string>());
-        using var stored = X509CertificateLoader.LoadPkcs12(Convert.FromBase64String(secret["data"]!["client.pfx"]!.GetValue<string>()), "");
+        // The chart's Secret now holds the registered certificate with its key.
+        var patch = Body(Single("PATCH", "/secrets/api"));
+        using var stored = X509CertificateLoader.LoadPkcs12(Convert.FromBase64String(patch["data"]!["client.pfx"]!.GetValue<string>()), "");
         Assert.Equal(registered["Certificate"]!.GetValue<string>(), Convert.ToBase64String(stored.RawData));
         Assert.True(stored.HasPrivateKey);
 
@@ -67,7 +65,7 @@ public sealed class BootstrapScriptTests : IDisposable
         var (pfx, thumbprint) = CreateCertificate("api");
         _harness
             .Respond("GET", $"{Leader}/databases?name=orders", 200)
-            .Respond("GET", $"{Kubernetes}/secrets/api", 200, Secret("owner-uid", pfx))
+            .Respond("GET", $"{Kubernetes}/secrets/api", 200, Secret(pfx))
             .Respond("GET", $"{Leader}/admin/certificates?thumbprint={thumbprint}", 200)
             .Respond("POST", $"{Leader}/admin/certificates/edit", 200)
             .Respond("GET", $"{Leader}/admin/certificates?start=0&*", 200, Certificates((thumbprint, "aspire.shop.api"), ("0123", "aspire.shop.api")))
@@ -80,22 +78,22 @@ public sealed class BootstrapScriptTests : IDisposable
         Assert.Equal(thumbprint, edited["Thumbprint"]!.GetValue<string>());
         Assert.Equal("""{"orders":"ReadWrite"}""", edited["Permissions"]!.ToJsonString());
 
-        // An older certificate with the application's name is revoked; nothing is created.
+        // An older certificate with the application's name is revoked; nothing is created or stored.
         Assert.Equal($"{Leader}/admin/certificates?thumbprint=0123", Assert.Single(_harness.Requests, r => r.Method == "DELETE").Url);
-        Assert.DoesNotContain(_harness.Requests, r => r.Method == "PUT" || r.Url.EndsWith("/secrets", StringComparison.Ordinal));
+        Assert.DoesNotContain(_harness.Requests, r => r.Method is "PUT" or "PATCH");
     }
 
     [Fact]
-    public async Task SecretTheChartDoesNotOwnIsNotTakenOver()
+    public async Task MissingSecretFailsTheJob()
     {
         _harness
             .Respond("GET", $"{Leader}/databases?name=orders", 200)
-            .Respond("GET", $"{Kubernetes}/secrets/api", 200, Secret("someone-else", CreateCertificate("api").Pfx));
+            .Respond("GET", $"{Kubernetes}/secrets/api", 404, """{"reason":"NotFound"}""");
 
         var result = await Run();
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("Secret 'api' was not created by this bootstrap", result.Output);
+        Assert.Contains("Reading Secret 'api', which the chart creates, failed: HTTP 404", result.Output);
         Assert.DoesNotContain(_harness.Requests, r => r.Url.Contains("/admin/certificates", StringComparison.Ordinal));
     }
 
@@ -117,11 +115,12 @@ public sealed class BootstrapScriptTests : IDisposable
         var full = Enumerable.Range(0, 1024).Select(i => (i.ToString("X40", System.Globalization.CultureInfo.InvariantCulture), $"team-{i}")).ToArray();
         _harness
             .Respond("GET", $"{Leader}/databases?name=orders", 200)
+            .Respond("GET", $"{Kubernetes}/secrets/api", 200, Secret(pfx: null))
             .Respond("PUT", $"{Leader}/admin/certificates", 201)
             .Respond("GET", $"{Leader}/admin/certificates?start=0&*", 200, Certificates(full))
             .Respond("GET", $"{Leader}/admin/certificates?start=1024&*", 200, Certificates(("0123", "aspire.shop.worker")))
             .Respond("DELETE", $"{Leader}/admin/certificates?thumbprint=*", 204)
-            .Respond("POST", $"{Kubernetes}/secrets", 201);
+            .Respond("PATCH", $"{Kubernetes}/secrets/api", 200);
 
         var result = await Run();
 
@@ -137,7 +136,6 @@ public sealed class BootstrapScriptTests : IDisposable
                 ["RAVENDB_DATABASES"] = "orders",
                 ["RAVENDB_REPLICATION_FACTOR"] = "2",
                 ["RAVENDB_APPLICATIONS"] = "api=orders",
-                ["RAVENDB_SECRET_OWNER"] = "ravendb-bootstrap",
             },
             "/bin/bash",
             "/ravendb/bootstrap/bootstrap.sh");
@@ -150,12 +148,15 @@ public sealed class BootstrapScriptTests : IDisposable
     private static string Certificates(params (string Thumbprint, string Name)[] certificates) =>
         JsonSerializer.Serialize(new { Results = certificates.Select(c => new { c.Thumbprint, c.Name }) });
 
-    private static string Secret(string ownerUid, byte[] pfx) =>
-        JsonSerializer.Serialize(new Dictionary<string, object>
-        {
-            ["metadata"] = new { name = "api", ownerReferences = new[] { new { uid = ownerUid } } },
-            ["data"] = new Dictionary<string, string> { ["client.pfx"] = Convert.ToBase64String(pfx) },
-        });
+    /// <summary>The Secret as the chart creates it (no data), or after the bootstrap filled it in.</summary>
+    private static string Secret(byte[]? pfx) =>
+        pfx is null
+            ? """{"metadata":{"name":"api"},"type":"Opaque"}"""
+            : JsonSerializer.Serialize(new Dictionary<string, object>
+            {
+                ["metadata"] = new { name = "api" },
+                ["data"] = new Dictionary<string, string> { ["client.pfx"] = Convert.ToBase64String(pfx) },
+            });
 
     private static (byte[] Pfx, string Thumbprint) CreateCertificate(string name)
     {

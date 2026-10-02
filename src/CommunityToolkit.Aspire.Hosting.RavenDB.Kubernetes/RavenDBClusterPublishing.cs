@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
@@ -106,7 +107,6 @@ internal static partial class RavenDBClusterPublishing
     /// <summary>The bootstrap's settings, apart from the URLs and the license.</summary>
     private static SortedDictionary<string, string> Settings(RavenDBClusterDeployment deployment) => new(StringComparer.Ordinal)
     {
-        ["RAVENDB_SECRET_OWNER"] = deployment.BootstrapName,
         ["RAVENDB_DATABASES"] = string.Join(' ', deployment.Server.DatabasesToCreate),
         ["RAVENDB_REPLICATION_FACTOR"] = deployment.Options.Nodes.ToString(CultureInfo.InvariantCulture),
         ["RAVENDB_APPLICATIONS"] = string.Join(' ', deployment.Consumers.Select(c =>
@@ -281,10 +281,10 @@ internal static partial class RavenDBClusterPublishing
             container.VolumeMounts.Add(new VolumeMountV1 { Name = "certificate-authority", MountPath = "/ravendb/ca", ReadOnly = true });
         }
 
-        // Jobs are immutable. A new name per configuration makes an upgrade run the new bootstrap instead of
-        // failing to patch the old Job; Helm removes the old one.
+        // Jobs are immutable. A new name per configuration, the pod's included, makes an upgrade run the new bootstrap
+        // instead of failing to patch the old Job; Helm removes the old one.
         var job = new KubernetesJob { Spec = { Template = template } };
-        job.Metadata.Name = $"{deployment.BootstrapName}-{ConfigurationHash(deployment)}";
+        job.Metadata.Name = $"{deployment.BootstrapName}-{ConfigurationHash(deployment, template)}";
 
         foreach (var (key, value) in k8s.Workload.Metadata.Labels)
         {
@@ -300,9 +300,10 @@ internal static partial class RavenDBClusterPublishing
         k8s.AdditionalResources.Add(script);
 
         k8s.AdditionalResources.AddRange(CreateAccess(deployment));
+        k8s.AdditionalResources.AddRange(CreateApplicationSecrets(deployment));
         k8s.AdditionalResources.Add(CreateCluster(deployment, k8s.Parent));
 
-        if (deployment.Options.IngressClassName == "traefik")
+        if (deployment.Options.IngressController == RavenDBIngressController.Traefik)
         {
             k8s.AdditionalResources.Add(CreateTraefikRoutes(deployment));
         }
@@ -336,13 +337,22 @@ internal static partial class RavenDBClusterPublishing
                     PublicServerUrlTcp = $"tcp://{deployment.NodeTcpHost(i)}:443",
                 })],
                 Storage = { Data = { Size = options.StorageSize, StorageClassName = options.StorageClassName ?? environment.DefaultStorageClassName } },
-                ExternalAccessConfiguration = { IngressControllerContext = { IngressClassName = options.IngressClassName } },
+                ExternalAccessConfiguration = { IngressControllerContext = { IngressClassName = IngressClassName(options.IngressController) } },
             },
         };
 
         cluster.Metadata.Name = deployment.ResourceName;
         return cluster;
     }
+
+    /// <summary>The names the operator's RavenDBCluster definition accepts.</summary>
+    private static string IngressClassName(RavenDBIngressController controller) => controller switch
+    {
+        RavenDBIngressController.Traefik => "traefik",
+        RavenDBIngressController.HAProxy => "haproxy",
+        RavenDBIngressController.Nginx => "nginx",
+        _ => throw new ArgumentOutOfRangeException(nameof(controller), controller, null),
+    };
 
     /// <summary>
     /// Traefik ignores the SSL passthrough annotations of the Ingress the operator creates, and RavenDB must see the
@@ -400,8 +410,22 @@ internal static partial class RavenDBClusterPublishing
     private static partial Regex HelmExpression();
 
     /// <summary>
-    /// The ServiceAccount, Role and RoleBinding of the bootstrap: read and create the applications' Secrets, and read
-    /// the ServiceAccount that owns them.
+    /// The applications' Secrets, empty: the bootstrap fills each in with the application's certificate. As part of
+    /// the chart, Helm refuses to take over a Secret of the same name it did not create, and removes them on uninstall.
+    /// </summary>
+    private static IEnumerable<Secret> CreateApplicationSecrets(RavenDBClusterDeployment deployment)
+    {
+        foreach (var consumer in deployment.Consumers)
+        {
+            var secret = new Secret { Type = "Opaque" };
+            secret.Metadata.Name = deployment.ApplicationSecretName(consumer.Resource);
+            yield return secret;
+        }
+    }
+
+    /// <summary>
+    /// The ServiceAccount, Role and RoleBinding of the bootstrap: read and fill in the applications' Secrets, by name,
+    /// and nothing else.
     /// </summary>
     private static IEnumerable<BaseKubernetesResource> CreateAccess(RavenDBClusterDeployment deployment)
     {
@@ -414,16 +438,12 @@ internal static partial class RavenDBClusterPublishing
 
         var role = new Role();
         role.Metadata.Name = $"{name}-role";
-        role.Rules.Add(Rule("serviceaccounts", "get", [name]));
 
         var secrets = deployment.Consumers.Select(c => deployment.ApplicationSecretName(c.Resource)).ToList();
 
         if (secrets.Count > 0)
         {
-            role.Rules.Add(Rule("secrets", "get", secrets));
-
-            // Kubernetes cannot restrict create to names.
-            role.Rules.Add(Rule("secrets", "create"));
+            role.Rules.Add(Rule("secrets", ["get", "patch"], secrets));
         }
 
         yield return role;
@@ -437,13 +457,13 @@ internal static partial class RavenDBClusterPublishing
         yield return binding;
     }
 
-    private static PolicyRuleV1 Rule(string resource, string verb, IEnumerable<string>? names = null)
+    private static PolicyRuleV1 Rule(string resource, IEnumerable<string> verbs, IEnumerable<string> names)
     {
         var rule = new PolicyRuleV1();
         rule.ApiGroups.Add(string.Empty);
         rule.Resources.Add(resource);
-        rule.Verbs.Add(verb);
-        rule.ResourceNames.AddRange(names ?? []);
+        rule.Verbs.AddRange(verbs);
+        rule.ResourceNames.AddRange(names);
         return rule;
     }
 
@@ -482,11 +502,13 @@ internal static partial class RavenDBClusterPublishing
     }
 
     /// <remarks>
-    /// Built from the values, not from the chart: the chart's ConfigMap only holds references to values.yaml.
+    /// Built from the values, not from the chart alone: the chart's ConfigMap only holds references to values.yaml.
+    /// The pod template counts too, so that a new version of this integration that changes it renames the Job.
     /// </remarks>
-    private static string ConfigurationHash(RavenDBClusterDeployment deployment)
+    private static string ConfigurationHash(RavenDBClusterDeployment deployment, PodTemplateSpecV1 template)
     {
         var configuration = new StringBuilder()
+            .AppendLine(JsonSerializer.Serialize(template))
             .AppendLine(Script)
             .AppendLine(FullImage(deployment))
             .AppendLine(deployment.ClientCertificateSecret)

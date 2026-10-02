@@ -3,13 +3,13 @@
 # RavenDB image, with the admin client certificate mounted, and:
 #   1. waits until the cluster accepts the admin certificate and every node has joined;
 #   2. creates the declared databases that do not exist yet;
-#   3. leaves every application with exactly one client certificate, with access to its databases only, stored in a
-#      Secret the application mounts, and revokes the certificates of applications that are gone. The private keys
-#      never leave the cluster.
+#   3. leaves every application with exactly one client certificate, with access to its databases only, stored in the
+#      Secret the application mounts (the chart creates it empty), and revokes the certificates of applications that
+#      are gone. The private keys never leave the cluster.
 # Every step is idempotent: the Job runs again on each deployment that changes its configuration.
 #
 # Input (environment): RAVENDB_URLS, RAVENDB_DATABASES, RAVENDB_REPLICATION_FACTOR,
-# RAVENDB_APPLICATIONS ("secret=db1,db2 ..."), RAVENDB_SECRET_OWNER.
+# RAVENDB_APPLICATIONS ("secret=db1,db2 ...").
 
 set -euo pipefail
 # No filename expansion of the settings, and only this user may read the keys written below.
@@ -47,11 +47,7 @@ fi
 
 # The token goes in a header file, not on the command line.
 printf 'Authorization: Bearer %s\n' "$(cat "$SERVICE_ACCOUNT/token")" > "$WORK/kubernetes-headers"
-KUBE=(curl -sS --connect-timeout 10 --max-time 30 --cacert "$SERVICE_ACCOUNT/ca.crt" -H "@$WORK/kubernetes-headers" -H "Content-Type: application/json")
-
-# The applications' Secrets belong to the chart's ServiceAccount: uninstalling the chart removes them, and a Secret
-# it does not own is not the bootstrap's to take over.
-OWNER_UID=$("${KUBE[@]}" -f "$KUBERNETES_API/api/v1/namespaces/$NAMESPACE/serviceaccounts/$RAVENDB_SECRET_OWNER" | jq -r .metadata.uid)
+KUBE=(curl -sS --connect-timeout 10 --max-time 30 --cacert "$SERVICE_ACCOUNT/ca.crt" -H "@$WORK/kubernetes-headers")
 
 read -r -a URLS <<< "$RAVENDB_URLS"
 LEADER="${URLS[0]}"
@@ -134,26 +130,23 @@ issue_application_certificate() {
     local permissions
     permissions=$(jq -cn --arg databases "$databases" '$databases | split(",") | map(select(. != "") | {(.): "ReadWrite"}) | add // {}')
 
+    # The chart creates the Secret empty; the Role grants reading and filling in that name only.
     local status
     status=$("${KUBE[@]}" -o "$WORK/secret.json" -w '%{http_code}' "$KUBERNETES_API/api/v1/namespaces/$NAMESPACE/secrets/$secret")
 
-    if [[ "$status" == "200" ]]; then
-        if ! jq -e --arg uid "$OWNER_UID" 'any(.metadata.ownerReferences[]?; .uid == $uid)' "$WORK/secret.json" > /dev/null; then
-            log "Secret '$secret' was not created by this bootstrap, so its certificate is not registered for the application." \
-                "Delete the Secret to get a new certificate, or mount it with WithRavenDBClientCertificateSecret."
-            exit 1
-        fi
+    if [[ "$status" != "200" ]]; then
+        log "Reading Secret '$secret', which the chart creates, failed: HTTP $status $(cat "$WORK/secret.json")"
+        exit 1
+    fi
 
+    if jq -e '.data["client.pfx"] // empty' "$WORK/secret.json" > /dev/null; then
         jq -r '.data["client.pfx"]' "$WORK/secret.json" | base64 -d > "$WORK/$secret.pfx"
         pkcs12 -in "$WORK/$secret.pfx" -clcerts -nokeys -out "$WORK/$secret.crt"
-    elif [[ "$status" == "404" ]]; then
+    else
         openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$secret" \
             -addext "extendedKeyUsage=clientAuth" \
             -keyout "$WORK/$secret.key" -out "$WORK/$secret.crt" 2>/dev/null
         openssl pkcs12 -export -inkey "$WORK/$secret.key" -in "$WORK/$secret.crt" -out "$WORK/$secret.pfx" -passout pass:
-    else
-        log "Reading Secret '$secret' failed: HTTP $status $(cat "$WORK/secret.json")"
-        exit 1
     fi
 
     local thumbprint
@@ -190,23 +183,13 @@ issue_application_certificate() {
         return 0
     fi
 
-    jq -n --arg name "$secret" --arg owner "$RAVENDB_SECRET_OWNER" --arg uid "$OWNER_UID" --arg pfx "$(base64 -w 0 < "$WORK/$secret.pfx")" '{
-        apiVersion: "v1",
-        kind: "Secret",
-        type: "Opaque",
-        metadata: {
-            name: $name,
-            labels: {"app.kubernetes.io/managed-by": "aspire-ravendb-bootstrap"},
-            ownerReferences: [{apiVersion: "v1", kind: "ServiceAccount", name: $owner, uid: $uid}]
-        },
-        data: {"client.pfx": $pfx}
-    }' > "$WORK/new-secret.json"
+    jq -n --arg pfx "$(base64 -w 0 < "$WORK/$secret.pfx")" '{data: {"client.pfx": $pfx}}' > "$WORK/secret-patch.json"
 
-    status=$("${KUBE[@]}" -o "$WORK/response" -w '%{http_code}' -X POST -d "@$WORK/new-secret.json" \
-        "$KUBERNETES_API/api/v1/namespaces/$NAMESPACE/secrets")
+    status=$("${KUBE[@]}" -o "$WORK/response" -w '%{http_code}' -X PATCH -H "Content-Type: application/merge-patch+json" \
+        -d "@$WORK/secret-patch.json" "$KUBERNETES_API/api/v1/namespaces/$NAMESPACE/secrets/$secret")
 
     if [[ "$status" != 2* ]]; then
-        log "Creating Secret '$secret' failed: HTTP $status $(cat "$WORK/response")"
+        log "Storing the certificate in Secret '$secret' failed: HTTP $status $(cat "$WORK/response")"
         exit 1
     fi
 

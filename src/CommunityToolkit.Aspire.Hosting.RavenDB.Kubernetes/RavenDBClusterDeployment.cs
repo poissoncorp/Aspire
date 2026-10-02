@@ -38,6 +38,9 @@ internal sealed class RavenDBClusterDeployment(RavenDBServerResource server, Rav
     /// <summary>Name of the bootstrap Job, known once the chart has been written.</summary>
     public string? BootstrapJobName { get; set; }
 
+    /// <summary>The bootstrap's chart files before this publish wrote the chart, with the time each was written.</summary>
+    public Dictionary<string, DateTime>? EarlierChartFiles { get; set; }
+
     public string ResourceName => RavenDBKubernetesCertificates.NameOf(Server);
 
     public string BootstrapName => $"{ResourceName}-bootstrap";

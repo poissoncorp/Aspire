@@ -1,5 +1,3 @@
-using System.Diagnostics;
-using System.Text.RegularExpressions;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Kubernetes;
 using Aspire.Hosting.Pipelines;
@@ -8,15 +6,34 @@ using Microsoft.Extensions.Logging;
 
 namespace CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes;
 
-/// <summary>
-/// The steps of a server published to Kubernetes: once the chart is written, drop the bootstrap Jobs of earlier
-/// configurations from it; before Helm, check that the operator is installed and delete a bootstrap Job that failed,
-/// so that it runs again; while Helm installs
-/// the chart, report what keeps the cluster or the bootstrap from getting ready; after Helm, wait until the bootstrap
-/// Job has created the databases and the applications' certificates. The Job itself waits for the operator.
-/// </summary>
-internal static partial class RavenDBClusterPipelineSteps
+/// <summary>How long the steps wait and how often they look; shortened in tests.</summary>
+/// <param name="Wait">How long the deployment waits for the bootstrap Job after Helm.</param>
+/// <param name="Watch">
+/// How long the watch runs next to Helm: Aspire runs <c>helm upgrade --wait</c> with Helm's default timeout of five
+/// minutes, and a watch that outlived a failed Helm would only hold the pipeline up.
+/// </param>
+/// <param name="JobAppearance">
+/// Helm creates the chart's objects within seconds of starting: a bootstrap Job that has not appeared by then means
+/// Helm failed before installing anything, and there is nothing left to watch.
+/// </param>
+/// <param name="Poll">Delay between two looks at the cluster.</param>
+internal sealed record RavenDBClusterTimings(TimeSpan Wait, TimeSpan Watch, TimeSpan JobAppearance, TimeSpan Poll)
 {
+    public static RavenDBClusterTimings Default { get; } =
+        new(TimeSpan.FromMinutes(20), TimeSpan.FromMinutes(5.5), TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(10));
+}
+
+/// <summary>
+/// The steps of a server published to Kubernetes: around the writing of the chart, drop the bootstrap's files of
+/// earlier publishes that this one does not write again; before Helm, check that the operator (and Traefik's resource types, for Traefik) are
+/// installed and delete a bootstrap Job that failed, so that it runs again; while Helm installs the chart, report
+/// what keeps the cluster or the bootstrap from getting ready; after Helm, wait until the bootstrap Job has created
+/// the databases and the applications' certificates. The Job itself waits for the operator.
+/// </summary>
+internal static class RavenDBClusterPipelineSteps
+{
+    public static string SnapshotStepName(RavenDBServerResource server) => $"ravendb-cluster-snapshot-{server.Name}";
+
     public static string PublishStepName(RavenDBServerResource server) => $"ravendb-cluster-publish-{server.Name}";
 
     public static string WatchStepName(RavenDBServerResource server) => $"ravendb-cluster-watch-{server.Name}";
@@ -28,32 +45,30 @@ internal static partial class RavenDBClusterPipelineSteps
     public static string CheckStepName(RavenDBServerResource server) => $"ravendb-cluster-check-{server.Name}";
 
     /// <summary>The operator's cluster type, fully qualified so that no other operator's RavenDBCluster answers.</summary>
-    private const string ClusterResourceType = "ravendbclusters.ravendb.ravendb.io";
+    internal const string ClusterResourceType = "ravendbclusters.ravendb.ravendb.io";
 
-    private static readonly TimeSpan s_timeout = TimeSpan.FromMinutes(20);
-
-    /// <summary>
-    /// How long the watch runs next to Helm: Aspire runs <c>helm upgrade --wait</c> with Helm's default timeout of
-    /// five minutes, and a watch that outlived a failed Helm would only hold the pipeline up.
-    /// </summary>
-    private static readonly TimeSpan s_watchTimeout = TimeSpan.FromMinutes(5.5);
-
-    /// <summary>
-    /// Helm creates the chart's objects within seconds of starting: a bootstrap Job that has not appeared by then means
-    /// Helm failed before installing anything, and there is nothing left to watch.
-    /// </summary>
-    private static readonly TimeSpan s_jobAppearanceTimeout = TimeSpan.FromMinutes(2);
-
-    private static readonly TimeSpan s_pollInterval = TimeSpan.FromSeconds(10);
+    /// <summary>The Traefik type of the routes the chart adds for Traefik.</summary>
+    internal const string TraefikRouteResourceType = "ingressroutetcps.traefik.io";
 
     public static IEnumerable<PipelineStep> Create(RavenDBClusterDeployment deployment)
     {
+        var snapshot = new PipelineStep
+        {
+            Name = SnapshotStepName(deployment.Server),
+            Description = $"Notes the chart files of earlier publishes of '{deployment.Server.Name}', before the chart is written again",
+            Resource = deployment.Server,
+            Action = context => NoteEarlierChartFilesAsync(deployment, context),
+        };
+
+        snapshot.RequiredBy(WellKnownPipelineSteps.Publish);
+        yield return snapshot;
+
         var publish = new PipelineStep
         {
             Name = PublishStepName(deployment.Server),
-            Description = $"Removes the bootstrap Jobs of earlier configurations of '{deployment.Server.Name}' from the chart",
+            Description = $"Removes the chart files of earlier publishes of '{deployment.Server.Name}' that this one did not write again",
             Resource = deployment.Server,
-            Action = context => RemoveEarlierJobsAsync(deployment, context),
+            Action = context => RemoveLeftoversAsync(deployment, context),
         };
 
         publish.RequiredBy(WellKnownPipelineSteps.Publish);
@@ -64,9 +79,11 @@ internal static partial class RavenDBClusterPipelineSteps
             Name = WatchStepName(deployment.Server),
             Description = $"Reports what keeps the RavenDB cluster or bootstrap of '{deployment.Server.Name}' from getting ready while Helm installs the chart",
             Resource = deployment.Server,
-            Action = context => WatchAsync(deployment, context),
+            Action = context => WithKubectlAsync(context, kubectl => WatchAsync(kubectl, deployment, context.Logger, RavenDBClusterTimings.Default, context.CancellationToken)),
         };
 
+        // Only once Helm is going to run: without the operator there would be nothing to watch.
+        watch.DependsOn(CheckStepName(deployment.Server));
         watch.RequiredBy(WellKnownPipelineSteps.Deploy);
         yield return watch;
 
@@ -75,7 +92,7 @@ internal static partial class RavenDBClusterPipelineSteps
             Name = CheckStepName(deployment.Server),
             Description = $"Checks that the RavenDB operator is installed in the Kubernetes cluster of '{deployment.Server.Name}'",
             Resource = deployment.Server,
-            Action = EnsureOperatorInstalledAsync,
+            Action = context => WithKubectlAsync(context, kubectl => EnsurePrerequisitesAsync(kubectl, deployment, context.CancellationToken)),
         };
 
         check.DependsOn(WellKnownPipelineSteps.DeployPrereq);
@@ -87,7 +104,7 @@ internal static partial class RavenDBClusterPipelineSteps
             Name = ResetStepName(deployment.Server),
             Description = $"Deletes a failed bootstrap Job of '{deployment.Server.Name}', so that Helm creates it again",
             Resource = deployment.Server,
-            Action = context => DeleteFailedJobAsync(deployment, context),
+            Action = context => WithKubectlAsync(context, kubectl => DeleteFailedJobAsync(kubectl, deployment, context.Logger, context.CancellationToken)),
         };
 
         reset.DependsOn(WellKnownPipelineSteps.DeployPrereq);
@@ -99,7 +116,13 @@ internal static partial class RavenDBClusterPipelineSteps
             Name = WaitStepName(deployment.Server),
             Description = $"Waits until the RavenDB bootstrap of '{deployment.Server.Name}' has completed",
             Resource = deployment.Server,
-            Action = context => WaitForBootstrapAsync(deployment, context),
+            Action = async context =>
+            {
+                await WithKubectlAsync(context, kubectl => WaitForBootstrapAsync(kubectl, deployment, context.Logger, RavenDBClusterTimings.Default, context.CancellationToken)).ConfigureAwait(false);
+
+                var url = await deployment.Url.GetValueAsync(context.CancellationToken).ConfigureAwait(false);
+                context.Summary.Add($"RavenDB ({deployment.Server.Name})", url ?? string.Empty);
+            },
         };
 
         wait.RequiredBy(WellKnownPipelineSteps.Deploy);
@@ -108,6 +131,7 @@ internal static partial class RavenDBClusterPipelineSteps
 
     public static void Configure(RavenDBClusterDeployment deployment, PipelineConfigurationContext context)
     {
+        var snapshot = context.Steps.FirstOrDefault(s => s.Name == SnapshotStepName(deployment.Server));
         var publish = context.Steps.FirstOrDefault(s => s.Name == PublishStepName(deployment.Server));
         var watch = context.Steps.FirstOrDefault(s => s.Name == WatchStepName(deployment.Server));
         var wait = context.Steps.FirstOrDefault(s => s.Name == WaitStepName(deployment.Server));
@@ -116,125 +140,165 @@ internal static partial class RavenDBClusterPipelineSteps
 
         foreach (var environment in context.Model.Resources.OfType<KubernetesEnvironmentResource>())
         {
-            var writeChart = $"publish-{environment.Name}";
-            var prepareHelm = $"prepare-{environment.Name}";
-            var helmDeploy = $"helm-deploy-{environment.Name}";
+            var writeChart = AspireSteps.Required(context, AspireSteps.Publish(environment));
+            publish?.DependsOn(writeChart);
 
-            if (publish is not null && context.Steps.Any(s => s.Name == writeChart))
+            if (snapshot is not null)
             {
-                publish.DependsOn(writeChart);
+                writeChart.DependsOn(snapshot);
             }
 
             // Next to Helm, not after it: when the cluster does not get ready, Helm only reports a timeout. The reset
             // needs the Job's name, known once the chart is written.
-            if (context.Steps.Any(s => s.Name == prepareHelm))
+            var prepare = AspireSteps.Required(context, AspireSteps.Prepare(environment));
+            watch?.DependsOn(prepare);
+            reset?.DependsOn(prepare);
+
+            var helm = AspireSteps.Required(context, AspireSteps.HelmDeploy(environment));
+            wait?.DependsOn(helm);
+
+            if (reset is not null)
             {
-                watch?.DependsOn(prepareHelm);
-                reset?.DependsOn(prepareHelm);
+                helm.DependsOn(reset);
             }
 
-            if (context.Steps.FirstOrDefault(s => s.Name == helmDeploy) is { } helm)
+            if (check is not null)
             {
-                wait?.DependsOn(helm);
-
-                if (reset is not null)
-                {
-                    helm.DependsOn(reset);
-                }
-
-                if (check is not null)
-                {
-                    helm.DependsOn(check);
-                }
+                helm.DependsOn(check);
             }
         }
     }
+
+    private static async Task WithKubectlAsync(PipelineStepContext context, Func<IKubectl, Task> action)
+    {
+        if (context.Model.Resources.OfType<KubernetesEnvironmentResource>().FirstOrDefault() is not { } environment)
+        {
+            return;
+        }
+
+        await action(await Kubectl.CreateAsync(environment, context.CancellationToken).ConfigureAwait(false)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Without the operator, Helm fails on the chart's <c>RavenDBCluster</c>, and without Traefik's resource types on
+    /// its routes, with messages that say neither what is missing nor how to install it. Any other failure to ask is
+    /// left to Helm, which reports it itself.
+    /// </summary>
+    internal static async Task EnsurePrerequisitesAsync(IKubectl kubectl, RavenDBClusterDeployment deployment, CancellationToken cancellationToken)
+    {
+        if (IsUnknownResourceType(await kubectl.TryRunAsync(["get", ClusterResourceType, "--output=name"], cancellationToken).ConfigureAwait(false)))
+        {
+            throw new InvalidOperationException(
+                "The RavenDB operator is not installed in the Kubernetes cluster: it has no RavenDBCluster resource type. " +
+                "Install cert-manager and the operator once per cluster, as the Prerequisites of " +
+                "https://www.nuget.org/packages/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes show.");
+        }
+
+        if (deployment.Options.IngressController == RavenDBIngressController.Traefik &&
+            IsUnknownResourceType(await kubectl.TryRunAsync(["get", TraefikRouteResourceType, "--output=name"], cancellationToken).ConfigureAwait(false)))
+        {
+            throw new InvalidOperationException(
+                "Traefik's resource types are not installed in the Kubernetes cluster: it has no IngressRouteTCP, which " +
+                "the chart routes the RavenDB nodes with. Install Traefik with its Kubernetes CRD provider, or set " +
+                "IngressController to the ingress controller the cluster runs.");
+        }
+    }
+
+    private static bool IsUnknownResourceType(KubectlResult result) =>
+        result.ExitCode != 0 && IsUnknownResourceType(result.Error);
+
+    internal static bool IsUnknownResourceType(string kubectlError) =>
+        kubectlError.Contains("the server doesn't have a resource type", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Logs, as they happen, the states Helm's wait would only report as a timeout: the operator putting the cluster in
     /// its Error phase (with the reasons it gives) and the bootstrap Job failing an attempt (with its last output).
     /// Never fails the deployment; <see cref="WaitForBootstrapAsync"/> decides.
     /// </summary>
-    private static async Task WatchAsync(RavenDBClusterDeployment deployment, PipelineStepContext context)
+    internal static async Task WatchAsync(IKubectl kubectl, RavenDBClusterDeployment deployment, ILogger logger, RavenDBClusterTimings timings, CancellationToken cancellationToken)
     {
-        if (deployment.BootstrapJobName is not { } job ||
-            context.Model.Resources.OfType<KubernetesEnvironmentResource>().FirstOrDefault() is not { } environment)
+        if (deployment.BootstrapJobName is not { } job)
         {
             return;
         }
 
-        var kubectl = await Kubectl.CreateAsync(environment, context.CancellationToken).ConfigureAwait(false);
-        var start = DateTimeOffset.UtcNow;
-        var reportedRestarts = 0;
-
-        while (DateTimeOffset.UtcNow < start + s_watchTimeout)
+        try
         {
-            var phase = await GetClusterPhaseAsync(kubectl, deployment, context.CancellationToken).ConfigureAwait(false);
+            var start = DateTimeOffset.UtcNow;
+            var reportedRestarts = 0;
 
-            // "<name>:<type>=<status>;..." once the Job exists, empty before.
-            var state = await kubectl.RunAsync(
-                ["get", "job", job, "--ignore-not-found", "-o", "jsonpath={.metadata.name}:{range .status.conditions[*]}{.type}={.status};{end}"],
-                context.CancellationToken, throwOnError: false).ConfigureAwait(false);
-
-            if (state.Length == 0 && DateTimeOffset.UtcNow > start + s_jobAppearanceTimeout)
+            while (DateTimeOffset.UtcNow < start + timings.Watch)
             {
-                return;
+                var phase = await GetClusterPhaseAsync(kubectl, deployment, cancellationToken).ConfigureAwait(false);
+
+                // "<name>:<type>=<status>;..." once the Job exists, empty before.
+                var state = await kubectl.OutputAsync(
+                    ["get", "job", job, "--ignore-not-found", "-o", "jsonpath={.metadata.name}:{range .status.conditions[*]}{.type}={.status};{end}"],
+                    cancellationToken).ConfigureAwait(false);
+
+                if (state.Length == 0 && DateTimeOffset.UtcNow > start + timings.JobAppearance)
+                {
+                    return;
+                }
+
+                // Helm waits for the cluster as well as for the applications the Job gives their certificates to.
+                if (phase == "Running" && (state.Contains("Complete=True", StringComparison.Ordinal) || state.Contains("Failed=True", StringComparison.Ordinal)))
+                {
+                    return;
+                }
+
+                if (phase == "Error")
+                {
+                    await ReportClusterErrorAsync(kubectl, deployment, logger, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
+                var restarts = await kubectl.OutputAsync(
+                    ["get", "pods", "-l", $"job-name={job}", "-o", "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{\"\\n\"}{end}"],
+                    cancellationToken).ConfigureAwait(false);
+
+                var count = restarts
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(r => int.TryParse(r, out var n) ? n : 0)
+                    .DefaultIfEmpty()
+                    .Max();
+
+                if (count > reportedRestarts)
+                {
+                    reportedRestarts = count;
+                    var output = await kubectl.OutputAsync(["logs", $"job/{job}", "--previous", "--tail=5"], cancellationToken).ConfigureAwait(false);
+
+                    logger.LogWarning(
+                        "Attempt {Attempt} of the RavenDB bootstrap Job '{Job}' failed; it is retried. Its last output:{NewLine}{Output}",
+                        count, job, Environment.NewLine, output.TrimEnd());
+                }
+
+                await Task.Delay(timings.Poll, cancellationToken).ConfigureAwait(false);
             }
-
-            // Helm waits for the cluster as well as for the applications the Job gives their certificates to.
-            if (phase == "Running" && (state.Contains("Complete=True", StringComparison.Ordinal) || state.Contains("Failed=True", StringComparison.Ordinal)))
-            {
-                return;
-            }
-
-            if (phase == "Error")
-            {
-                await ReportClusterErrorAsync(deployment, kubectl, context).ConfigureAwait(false);
-                return;
-            }
-
-            var restarts = await kubectl.RunAsync(
-                ["get", "pods", "-l", $"job-name={job}", "-o", "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{\"\\n\"}{end}"],
-                context.CancellationToken, throwOnError: false).ConfigureAwait(false);
-
-            var count = restarts
-                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                .Select(r => int.TryParse(r, out var n) ? n : 0)
-                .DefaultIfEmpty()
-                .Max();
-
-            if (count > reportedRestarts)
-            {
-                reportedRestarts = count;
-                var output = await kubectl.RunAsync(["logs", $"job/{job}", "--previous", "--tail=5"], context.CancellationToken, throwOnError: false).ConfigureAwait(false);
-
-                context.Logger.LogWarning(
-                    "Attempt {Attempt} of the RavenDB bootstrap Job '{Job}' failed; it is retried. Its last output:{NewLine}{Output}",
-                    count, job, Environment.NewLine, output.TrimEnd());
-            }
-
-            await Task.Delay(s_pollInterval, context.CancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            logger.LogWarning(exception, "Watching the RavenDB cluster '{Cluster}' stopped; Helm still decides.", deployment.ResourceName);
         }
     }
 
     /// <returns>The phase the operator reports for the cluster, or an empty string before it reports one.</returns>
-    private static async Task<string> GetClusterPhaseAsync(Kubectl kubectl, RavenDBClusterDeployment deployment, CancellationToken cancellationToken) =>
-        (await kubectl.RunAsync(
-            ["get", "ravendbcluster", deployment.ResourceName, "--ignore-not-found", "-o", "jsonpath={.status.phase}"],
-            cancellationToken,
-            throwOnError: false).ConfigureAwait(false)).Trim();
+    private static async Task<string> GetClusterPhaseAsync(IKubectl kubectl, RavenDBClusterDeployment deployment, CancellationToken cancellationToken) =>
+        (await kubectl.OutputAsync(
+            ["get", ClusterResourceType, deployment.ResourceName, "--ignore-not-found", "-o", "jsonpath={.status.phase}"],
+            cancellationToken).ConfigureAwait(false)).Trim();
 
-    private static async Task ReportClusterErrorAsync(RavenDBClusterDeployment deployment, Kubectl kubectl, PipelineStepContext context)
+    private static async Task ReportClusterErrorAsync(IKubectl kubectl, RavenDBClusterDeployment deployment, ILogger logger, CancellationToken cancellationToken)
     {
-        var problems = await kubectl.RunAsync(
-            ["get", "ravendbcluster", deployment.ResourceName, "-o", "jsonpath={range .status.conditions[?(@.status==\"False\")]}  {.type}: {.message}{\"\\n\"}{end}"],
-            context.CancellationToken, throwOnError: false).ConfigureAwait(false);
-        var warnings = await kubectl.RunAsync(
+        var problems = await kubectl.OutputAsync(
+            ["get", ClusterResourceType, deployment.ResourceName, "-o", "jsonpath={range .status.conditions[?(@.status==\"False\")]}  {.type}: {.message}{\"\\n\"}{end}"],
+            cancellationToken).ConfigureAwait(false);
+        var warnings = await kubectl.OutputAsync(
             ["get", "events", "--field-selector", $"involvedObject.kind=RavenDBCluster,involvedObject.name={deployment.ResourceName},type=Warning",
              "--sort-by=.lastTimestamp", "-o", "jsonpath={range .items[*]}  {.reason}: {.message}{\"\\n\"}{end}"],
-            context.CancellationToken, throwOnError: false).ConfigureAwait(false);
+            cancellationToken).ConfigureAwait(false);
 
-        context.Logger.LogWarning(
+        logger.LogWarning(
             "The RavenDB operator reports cluster '{Cluster}' in its Error phase, so Helm will wait for it in vain.{NewLine}{Problems}Latest warnings:{NewLine}{Warnings}",
             deployment.ResourceName,
             Environment.NewLine,
@@ -244,125 +308,104 @@ internal static partial class RavenDBClusterPipelineSteps
     }
 
     /// <summary>
-    /// The Job is named after its configuration, and Aspire names the template file after the object and keeps the
-    /// files of earlier publishes in the output directory: without this, every configuration change would leave one
-    /// more Job in the chart.
+    /// Aspire writes the chart into the same directory on every publish and never deletes what earlier ones wrote. The
+    /// bootstrap's own files change with its configuration (the Job is named after it, the Traefik routes and the
+    /// applications' Secrets come and go), so the ones this publish does not write again are leftovers.
     /// </summary>
-    private static Task RemoveEarlierJobsAsync(RavenDBClusterDeployment deployment, PipelineStepContext context)
+    private static Task NoteEarlierChartFilesAsync(RavenDBClusterDeployment deployment, PipelineStepContext context)
     {
-        var environments = context.Model.Resources.OfType<IComputeEnvironmentResource>().ToList();
+        var directory = BootstrapChartDirectory(deployment, context);
 
-        if (deployment.BootstrapJobName is not { } job || environments.OfType<KubernetesEnvironmentResource>().FirstOrDefault() is not { } environment)
+        deployment.EarlierChartFiles = directory is not null && Directory.Exists(directory)
+            ? Directory.EnumerateFiles(directory).ToDictionary(f => f, File.GetLastWriteTimeUtc)
+            : [];
+
+        return Task.CompletedTask;
+    }
+
+    private static Task RemoveLeftoversAsync(RavenDBClusterDeployment deployment, PipelineStepContext context)
+    {
+        foreach (var (file, written) in deployment.EarlierChartFiles ?? [])
         {
-            return Task.CompletedTask;
-        }
-
-        var output = context.Services.GetRequiredService<IPipelineOutputService>();
-        var chart = RavenDBPublishing.OutputDirectory(output, environment, environments.Count);
-        var templates = Path.Combine(chart, "templates", deployment.BootstrapName);
-
-        if (!Directory.Exists(templates))
-        {
-            return Task.CompletedTask;
-        }
-
-        var current = $"{job[(deployment.BootstrapName.Length + 1)..]}.yaml";
-
-        foreach (var file in Directory.EnumerateFiles(templates, "*.yaml"))
-        {
-            var name = Path.GetFileName(file);
-
-            if (name != current && JobFileName().IsMatch(name))
+            if (File.Exists(file) && File.GetLastWriteTimeUtc(file) == written)
             {
                 File.Delete(file);
-                context.Logger.LogInformation("Removed the bootstrap Job of an earlier configuration from the chart: {File}.", name);
+                context.Logger.LogInformation("Removed a chart file of an earlier configuration: {File}.", Path.GetFileName(file));
             }
         }
 
         return Task.CompletedTask;
     }
 
-    /// <summary>
-    /// Without the operator, Helm fails on the chart's <c>RavenDBCluster</c> with a message that names neither the
-    /// operator nor how to install it. Any other failure to ask is left to Helm, which reports it itself.
-    /// </summary>
-    private static async Task EnsureOperatorInstalledAsync(PipelineStepContext context)
+    private static string? BootstrapChartDirectory(RavenDBClusterDeployment deployment, PipelineStepContext context)
     {
-        if (context.Model.Resources.OfType<KubernetesEnvironmentResource>().FirstOrDefault() is not { } environment)
+        var environments = context.Model.Resources.OfType<IComputeEnvironmentResource>().ToList();
+
+        if (environments.OfType<KubernetesEnvironmentResource>().FirstOrDefault() is not { } environment)
         {
-            return;
+            return null;
         }
 
-        var kubectl = await Kubectl.CreateAsync(environment, context.CancellationToken).ConfigureAwait(false);
-        var result = await kubectl.TryRunAsync(["get", ClusterResourceType, "--output=name"], context.CancellationToken).ConfigureAwait(false);
-
-        if (result.ExitCode != 0 && IsUnknownResourceType(result.Error))
-        {
-            throw new InvalidOperationException(
-                "The RavenDB operator is not installed in the Kubernetes cluster: it has no RavenDBCluster resource type. " +
-                "Install cert-manager and the operator once per cluster, as the Prerequisites of " +
-                "https://www.nuget.org/packages/CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes show.");
-        }
+        var output = context.Services.GetRequiredService<IPipelineOutputService>();
+        return Path.Combine(RavenDBPublishing.OutputDirectory(output, environment, environments.Count), "templates", deployment.BootstrapName);
     }
-
-    internal static bool IsUnknownResourceType(string kubectlError) =>
-        kubectlError.Contains("the server doesn't have a resource type", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// The Job is named after its configuration, so a deployment that fixes what made it fail (DNS, a Secret) renders
     /// the same Job, which Helm leaves as it is. Deleted, it is created again and runs anew.
     /// </summary>
-    private static async Task DeleteFailedJobAsync(RavenDBClusterDeployment deployment, PipelineStepContext context)
-    {
-        if (deployment.BootstrapJobName is not { } job ||
-            context.Model.Resources.OfType<KubernetesEnvironmentResource>().FirstOrDefault() is not { } environment)
-        {
-            return;
-        }
-
-        var kubectl = await Kubectl.CreateAsync(environment, context.CancellationToken).ConfigureAwait(false);
-        var conditions = await kubectl.RunAsync(
-            ["get", "job", job, "--ignore-not-found", "-o", "jsonpath={range .status.conditions[*]}{.type}={.status};{end}"],
-            context.CancellationToken, throwOnError: false).ConfigureAwait(false);
-
-        if (conditions.Contains("Failed=True", StringComparison.Ordinal))
-        {
-            await kubectl.RunAsync(["delete", "job", job, "--wait=true"], context.CancellationToken).ConfigureAwait(false);
-            context.Logger.LogInformation("Deleted the failed RavenDB bootstrap Job '{Job}', so that this deployment runs it again.", job);
-        }
-    }
-
-    [GeneratedRegex("^[0-9a-f]{10}\\.yaml$")]
-    private static partial Regex JobFileName();
-
-    private static async Task WaitForBootstrapAsync(RavenDBClusterDeployment deployment, PipelineStepContext context)
+    internal static async Task DeleteFailedJobAsync(IKubectl kubectl, RavenDBClusterDeployment deployment, ILogger logger, CancellationToken cancellationToken)
     {
         if (deployment.BootstrapJobName is not { } job)
         {
-            context.Logger.LogWarning("The RavenDB bootstrap of '{Server}' is not part of this deployment.", deployment.Server.Name);
             return;
         }
 
-        var environment = context.Model.Resources.OfType<KubernetesEnvironmentResource>().First();
-        var kubectl = await Kubectl.CreateAsync(environment, context.CancellationToken).ConfigureAwait(false);
-        var deadline = DateTimeOffset.UtcNow + s_timeout;
+        var conditions = await kubectl.OutputAsync(
+            ["get", "job", job, "--ignore-not-found", "-o", "jsonpath={range .status.conditions[*]}{.type}={.status};{end}"],
+            cancellationToken).ConfigureAwait(false);
+
+        if (conditions.Contains("Failed=True", StringComparison.Ordinal))
+        {
+            await kubectl.RunAsync(["delete", "job", job, "--wait=true"], cancellationToken).ConfigureAwait(false);
+            logger.LogInformation("Deleted the failed RavenDB bootstrap Job '{Job}', so that this deployment runs it again.", job);
+        }
+    }
+
+    /// <summary>
+    /// Waits for the bootstrap Job. A failed look at it (the API server busy, a dropped connection) is looked at again
+    /// until the deadline: Helm has already succeeded, so giving up on one error would fail a deployment that works.
+    /// </summary>
+    internal static async Task WaitForBootstrapAsync(IKubectl kubectl, RavenDBClusterDeployment deployment, ILogger logger, RavenDBClusterTimings timings, CancellationToken cancellationToken)
+    {
+        if (deployment.BootstrapJobName is not { } job)
+        {
+            logger.LogWarning("The RavenDB bootstrap of '{Server}' is not part of this deployment.", deployment.Server.Name);
+            return;
+        }
+
+        var deadline = DateTimeOffset.UtcNow + timings.Wait;
         var lastReport = DateTimeOffset.MinValue;
+        var lastError = string.Empty;
 
         while (true)
         {
-            var conditions = await kubectl.RunAsync(
+            var result = await kubectl.TryRunAsync(
                 ["get", "job", job, "-o", "jsonpath={range .status.conditions[*]}{.type}={.status};{end}"],
-                context.CancellationToken).ConfigureAwait(false);
+                cancellationToken).ConfigureAwait(false);
 
-            if (conditions.Contains("Complete=True", StringComparison.Ordinal))
+            if (result.ExitCode != 0)
             {
-                context.Logger.LogInformation("The RavenDB bootstrap of '{Server}' has completed.", deployment.Server.Name);
-                break;
+                lastError = result.Error.Trim();
             }
-
-            if (conditions.Contains("Failed=True", StringComparison.Ordinal))
+            else if (result.Output.Contains("Complete=True", StringComparison.Ordinal))
             {
-                var logs = await kubectl.RunAsync(["logs", $"job/{job}", "--tail=20"], context.CancellationToken, throwOnError: false).ConfigureAwait(false);
+                logger.LogInformation("The RavenDB bootstrap of '{Server}' has completed.", deployment.Server.Name);
+                return;
+            }
+            else if (result.Output.Contains("Failed=True", StringComparison.Ordinal))
+            {
+                var logs = await kubectl.OutputAsync(["logs", $"job/{job}", "--tail=20"], cancellationToken).ConfigureAwait(false);
 
                 throw new InvalidOperationException(
                     $"The RavenDB bootstrap Job '{job}' failed. Its last output:{Environment.NewLine}{logs}");
@@ -370,94 +413,24 @@ internal static partial class RavenDBClusterPipelineSteps
 
             if (DateTimeOffset.UtcNow > deadline)
             {
-                throw new TimeoutException($"The RavenDB bootstrap Job '{job}' did not complete within {s_timeout}.");
+                throw new TimeoutException(
+                    $"The RavenDB bootstrap Job '{job}' did not complete within {timings.Wait}." +
+                    (lastError.Length > 0 ? $" Last error: {lastError}" : string.Empty));
             }
 
             if (DateTimeOffset.UtcNow - lastReport > TimeSpan.FromMinutes(1))
             {
                 lastReport = DateTimeOffset.UtcNow;
 
-                var phase = await GetClusterPhaseAsync(kubectl, deployment, context.CancellationToken).ConfigureAwait(false);
+                var phase = await GetClusterPhaseAsync(kubectl, deployment, cancellationToken).ConfigureAwait(false);
 
-                context.Logger.LogInformation(
+                logger.LogInformation(
                     "Waiting for the RavenDB bootstrap Job '{Job}'{Phase}.",
                     job,
                     phase.Length == 0 ? string.Empty : $" (cluster: {phase})");
             }
 
-            await Task.Delay(s_pollInterval, context.CancellationToken).ConfigureAwait(false);
-        }
-
-        var url = await deployment.Url.GetValueAsync(context.CancellationToken).ConfigureAwait(false);
-        context.Summary.Add($"RavenDB ({deployment.Server.Name})", url ?? string.Empty);
-    }
-
-    /// <summary>kubectl, pointed at the namespace and kubeconfig Helm deploys with.</summary>
-    private sealed class Kubectl(IReadOnlyList<string> globalArguments)
-    {
-        public static async Task<Kubectl> CreateAsync(KubernetesEnvironmentResource environment, CancellationToken cancellationToken)
-        {
-            // One stalled call must not outlive the step's own deadlines.
-            var arguments = new List<string> { "--request-timeout=30s" };
-
-            if (environment.KubeConfigPath is { Length: > 0 } kubeConfig)
-            {
-                arguments.AddRange(["--kubeconfig", kubeConfig]);
-            }
-
-            // Aspire deploys to the "default" namespace when none is set, whatever the kube context says.
-            var ns = environment.Annotations.OfType<KubernetesNamespaceAnnotation>().LastOrDefault() is { } annotation
-                ? await annotation.Namespace.GetValueAsync(cancellationToken).ConfigureAwait(false)
-                : null;
-
-            arguments.AddRange(["--namespace", ns is { Length: > 0 } ? ns : "default"]);
-
-            return new Kubectl(arguments);
-        }
-
-        public async Task<string> RunAsync(IReadOnlyList<string> arguments, CancellationToken cancellationToken, bool throwOnError = true)
-        {
-            var result = await TryRunAsync(arguments, cancellationToken).ConfigureAwait(false);
-
-            if (result.ExitCode != 0 && throwOnError)
-            {
-                throw new InvalidOperationException($"kubectl {string.Join(' ', arguments)} failed: {result.Error.Trim()}");
-            }
-
-            return result.Output;
-        }
-
-        public async Task<(int ExitCode, string Output, string Error)> TryRunAsync(IReadOnlyList<string> arguments, CancellationToken cancellationToken)
-        {
-            var start = new ProcessStartInfo("kubectl")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            };
-
-            foreach (var argument in globalArguments.Concat(arguments))
-            {
-                start.ArgumentList.Add(argument);
-            }
-
-            using var process = Process.Start(start)
-                ?? throw new InvalidOperationException("kubectl could not be started.");
-
-            var output = process.StandardOutput.ReadToEndAsync(cancellationToken);
-            var error = process.StandardError.ReadToEndAsync(cancellationToken);
-
-            try
-            {
-                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                process.Kill(entireProcessTree: true);
-                throw;
-            }
-
-            return (process.ExitCode, await output.ConfigureAwait(false), await error.ConfigureAwait(false));
+            await Task.Delay(timings.Poll, cancellationToken).ConfigureAwait(false);
         }
     }
 }

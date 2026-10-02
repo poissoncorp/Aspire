@@ -104,10 +104,23 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         Assert.Equal(
             "ravendb-api-client-certificate=orders ravendb-worker-client-certificate=archive,orders,reports",
             settings.Scalar("RAVENDB_APPLICATIONS"));
-        Assert.Equal("ravendb-bootstrap", settings.Scalar("RAVENDB_SECRET_OWNER"));
 
         // The license is for the operator: the Job gets no secrets at all.
         Assert.DoesNotContain(chart.All("Secret"), s => s.Scalar("metadata", "name") == "ravendb-bootstrap-secrets");
+    }
+
+    [Fact]
+    public async Task ChartCreatesTheApplicationsSecretsEmptyForTheBootstrapToFillIn()
+    {
+        using var chart = await Publish(builder =>
+        {
+            var orders = AddCluster(builder).AddDatabase("orders");
+            builder.AddContainer("api", "busybox").WithReference(orders);
+        });
+
+        var secret = chart.Single("Secret", "ravendb-api-client-certificate");
+        Assert.Equal("Opaque", secret.Scalar("type"));
+        Assert.True(secret.Find("data") is null or YamlMappingNode { Children.Count: 0 });
     }
 
     [Fact]
@@ -124,13 +137,12 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         var rules = chart.Single("Role", "ravendb-bootstrap-role").Items("rules")
             .Select(r => (
                 Resource: r.Items("resources").Single().ToString(),
-                Verb: r.Items("verbs").Single().ToString(),
+                Verbs: string.Join(",", r.Items("verbs")),
                 Names: r.Find("resourceNames") is YamlSequenceNode names ? string.Join(",", names) : ""))
             .ToList();
 
-        Assert.Equal(
-            [("serviceaccounts", "get", "ravendb-bootstrap"), ("secrets", "get", "ravendb-api-client-certificate"), ("secrets", "create", "")],
-            rules);
+        // Reading and filling in the applications' Secrets by name; no create, which Kubernetes cannot limit to names.
+        Assert.Equal([("secrets", "get,patch", "ravendb-api-client-certificate")], rules);
 
         var binding = chart.Single("RoleBinding");
         Assert.Equal("ravendb-bootstrap-role", binding.Scalar("roleRef", "name"));
@@ -175,7 +187,7 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         using var chart = await Publish(builder => AddCluster(builder, cluster =>
         {
             cluster.Nodes = 2;
-            cluster.IngressClassName = "traefik";
+            cluster.IngressController = RavenDBIngressController.Traefik;
         }));
 
         Assert.Equal("traefik", chart.Single("RavenDBCluster").Scalar("spec", "externalAccessConfiguration", "ingressControllerContext", "ingressClassName"));
@@ -200,11 +212,11 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
     }
 
     [Theory]
-    [InlineData("haproxy")]
-    [InlineData("nginx")]
-    public async Task OtherIngressControllersPassTlsThroughForTheOperatorsIngressAlone(string ingressClassName)
+    [InlineData(RavenDBIngressController.HAProxy, "haproxy")]
+    [InlineData(RavenDBIngressController.Nginx, "nginx")]
+    public async Task OtherIngressControllersPassTlsThroughForTheOperatorsIngressAlone(RavenDBIngressController controller, string ingressClassName)
     {
-        using var chart = await Publish(builder => AddCluster(builder, cluster => cluster.IngressClassName = ingressClassName));
+        using var chart = await Publish(builder => AddCluster(builder, cluster => cluster.IngressController = controller));
 
         Assert.Equal(ingressClassName, chart.Single("RavenDBCluster").Scalar("spec", "externalAccessConfiguration", "ingressControllerContext", "ingressClassName"));
         Assert.Empty(chart.All("IngressRouteTCP"));
@@ -290,6 +302,44 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
 
             Assert.Equal(first, await JobName("orders"));
             Assert.NotEqual(first, await JobName("orders", "reports"));
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ChartFilesOfAnEarlierConfigurationAreRemoved()
+    {
+        // Published into the same directory, as aspire deploy does: Aspire keeps the files of earlier publishes.
+        var directory = Directory.CreateTempSubdirectory(".ravendb-cluster-publish-test");
+
+        try
+        {
+            using (var first = await Publish(builder =>
+            {
+                var orders = AddCluster(builder).AddDatabase("orders");
+                builder.AddContainer("api", "busybox").WithReference(orders);
+                builder.AddContainer("worker", "busybox").WithReference(orders);
+            }, into: directory))
+            {
+                Assert.Single(first.All("IngressRouteTCP"));
+                Assert.Single(first.All("Secret"), s => s.Scalar("metadata", "name") == "ravendb-worker-client-certificate");
+            }
+
+            // Away from Traefik, and without the worker.
+            using var second = await Publish(builder =>
+            {
+                var orders = AddCluster(builder, cluster => cluster.IngressController = RavenDBIngressController.Nginx).AddDatabase("orders");
+                builder.AddContainer("api", "busybox").WithReference(orders);
+            }, into: directory);
+
+            Assert.Empty(second.Errors);
+            Assert.Empty(second.All("IngressRouteTCP"));
+            Assert.DoesNotContain(second.All("Secret"), s => s.Scalar("metadata", "name") == "ravendb-worker-client-certificate");
+            Assert.Single(second.All("Secret"), s => s.Scalar("metadata", "name") == "ravendb-api-client-certificate");
+            Assert.Single(second.All("Job"));
         }
         finally
         {
@@ -435,20 +485,18 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         Assert.Contains("is not a domain the nodes can be published under", exception.Message, StringComparison.Ordinal);
     }
 
-    [Theory]
-    [InlineData("istio")]
-    [InlineData("Traefik")]
-    public void IngressControllerTheOperatorDoesNotSupportIsRejectedRightAway(string ingressClassName)
+    [Fact]
+    public void IngressControllerTheOperatorDoesNotSupportIsRejectedRightAway()
     {
         using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Run);
 
         var exception = Assert.Throws<ArgumentException>(() => builder.AddRavenDB("ravendb").PublishAsRavenDBCluster(cluster =>
         {
             ConfigureCluster(cluster);
-            cluster.IngressClassName = ingressClassName;
+            cluster.IngressController = (RavenDBIngressController)42;
         }));
 
-        Assert.Contains($"traefik, haproxy or nginx, not '{ingressClassName}'", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Traefik, HAProxy or ingress-nginx, not '42'", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -543,12 +591,6 @@ public class RavenDBClusterPublishTests(ITestOutputHelper output)
         Assert.Contains(WellKnownPipelineSteps.DeployPrereq, check.DependsOnSteps);
     }
 
-    [Theory]
-    [InlineData("error: the server doesn't have a resource type \"ravendbclusters\"", true)]
-    [InlineData("Error from server (Forbidden): ravendbclusters.ravendb.ravendb.io is forbidden", false)]
-    [InlineData("Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused", false)]
-    public void OnlyAMissingResourceTypeMeansTheOperatorIsNotInstalled(string kubectlError, bool missing) =>
-        Assert.Equal(missing, RavenDBClusterPipelineSteps.IsUnknownResourceType(kubectlError));
 
     [Fact]
     public void ScriptSurvivesHelmAndLinux()
