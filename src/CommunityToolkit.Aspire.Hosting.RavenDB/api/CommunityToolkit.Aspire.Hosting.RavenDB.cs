@@ -43,8 +43,12 @@ namespace Aspire.Hosting
 
     public static partial class RavenDBClientCertificateExtensions
     {
-        [AspireExport("withRavenDBDatabaseClientCertificateFile", MethodName = "withRavenDBClientCertificateFile")]
+        [AspireExportIgnore(Reason = "Polyglot app hosts pass the server: ATS allows one export per member name and target type.")]
         public static ApplicationModel.IResourceBuilder<T> WithRavenDBClientCertificateFile<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBDatabaseResource> database, string path, string? certificateAuthority = null)
+            where T : ApplicationModel.IComputeResource { throw null; }
+
+        [AspireExport("withRavenDBServerClientCertificateFile", MethodName = "withRavenDBClientCertificateFile")]
+        public static ApplicationModel.IResourceBuilder<T> WithRavenDBClientCertificateFile<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> server, string path, string? certificateAuthority = null)
             where T : ApplicationModel.IComputeResource { throw null; }
     }
 }

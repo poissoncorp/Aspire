@@ -11,8 +11,7 @@ public sealed class ComposeBootstrapScriptTests : IDisposable
 {
     private const string Server = "http://ravendb:8080";
 
-    private readonly ShellScriptHarness _harness = new ShellScriptHarness()
-        .Respond("GET", Server + RavenDBPublishing.ReadinessPath, 200);
+    private readonly ShellScriptHarness _harness = new();
 
     public void Dispose() => _harness.Dispose();
 
@@ -31,18 +30,6 @@ public sealed class ComposeBootstrapScriptTests : IDisposable
         Assert.Equal("""{"DatabaseName":"reports"}""", created.Body);
         Assert.Contains("database orders already exists", result.Output);
         Assert.Contains("created database reports", result.Output);
-    }
-
-    [Fact]
-    public async Task WaitsUntilTheServerAnswers()
-    {
-        using var harness = new ShellScriptHarness()
-            .Respond("GET", Server + RavenDBPublishing.ReadinessPath, [503, 200]);
-
-        var result = await harness.RunAsync(new Dictionary<string, string>(), "/bin/sh", "-c", RavenDBPublishing.BuildBootstrapScript(Server, []));
-
-        Assert.True(result.ExitCode == 0, result.ToString());
-        Assert.Equal(2, harness.Requests.Count);
     }
 
     [Fact]

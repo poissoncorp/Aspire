@@ -453,7 +453,7 @@ public static class RavenDBBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(source);
 
-        return builder.WithBindMount(source, "/var/lib/ravendb/data", isReadOnly);
+        return builder.WithBindMount(source, RavenDBPublishing.DataDirectory, isReadOnly);
     }
 
     /// <summary>
@@ -468,7 +468,7 @@ public static class RavenDBBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        return builder.WithVolume(name ?? VolumeNameGenerator.Generate(builder, "data"), "/var/lib/ravendb/data", isReadOnly);
+        return builder.WithVolume(name ?? VolumeNameGenerator.Generate(builder, "data"), RavenDBPublishing.DataDirectory, isReadOnly);
     }
 
     /// <summary>

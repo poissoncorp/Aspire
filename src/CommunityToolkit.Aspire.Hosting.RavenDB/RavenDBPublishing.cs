@@ -26,9 +26,7 @@ internal static partial class RavenDBPublishing
 
     internal const string DataDirectory = "/var/lib/ravendb/data";
 
-    internal const string DeploymentConsiderationsUrl = "https://docs.ravendb.net/7.2/start/installation/deployment-considerations";
-
-    internal const string AzureContainerAppsArticleUrl = "https://github.com/ravendb/docs/pull/2293";
+    private const string DeploymentConsiderationsUrl = "https://docs.ravendb.net/7.2/start/installation/deployment-considerations";
 
     /// <summary>Compute environments whose only persistent storage is Azure Files (SMB / NFS).</summary>
     private static readonly HashSet<string> s_networkStorageEnvironments = new(StringComparer.Ordinal)
@@ -65,7 +63,9 @@ internal static partial class RavenDBPublishing
                 RemoveDependenciesOnServer(builder, @event.Model);
             }
 
-            MountBroughtCertificates(builder, consumers, composeEnvironments, @event.Services.GetRequiredService<IPipelineOutputService>());
+            // Aspire gives each environment a directory of its own as soon as there are several of any kind.
+            var environmentCount = @event.Model.Resources.OfType<IComputeEnvironmentResource>().Count();
+            MountBroughtCertificates(builder, consumers, composeEnvironments, environmentCount, @event.Services.GetRequiredService<IPipelineOutputService>());
 
             return Task.CompletedTask;
         });
@@ -210,6 +210,7 @@ internal static partial class RavenDBPublishing
         IResourceBuilder<RavenDBServerResource> builder,
         IReadOnlyList<RavenDBConsumer> consumers,
         IReadOnlyList<DockerComposeEnvironmentResource> composeEnvironments,
+        int environmentCount,
         IPipelineOutputService output)
     {
         foreach (var consumer in consumers)
@@ -223,7 +224,7 @@ internal static partial class RavenDBPublishing
             {
                 // Docker Compose resolves the path against the compose file. Relative to it, the published artifacts
                 // keep working on another machine with the same layout, such as a CI runner.
-                var directory = OutputDirectory(output, environment, composeEnvironments.Count);
+                var directory = OutputDirectory(output, environment, environmentCount);
                 string RelativeToCompose(string file) => Path.GetRelativePath(directory, file).Replace('\\', '/');
 
                 var path = RelativeToCompose(certificate.Location);
@@ -235,7 +236,10 @@ internal static partial class RavenDBPublishing
         }
     }
 
-    /// <summary>Where an environment writes its artifacts: its own directory once there are several.</summary>
+    /// <summary>
+    /// Where an environment writes its artifacts: its own directory once the model has several compute environments
+    /// of any kind, as Aspire decides it.
+    /// </summary>
     internal static string OutputDirectory(IPipelineOutputService output, IResource environment, int environmentCount) =>
         environmentCount > 1 ? output.GetOutputDirectory(environment) : output.GetOutputDirectory();
 
@@ -275,7 +279,8 @@ internal static partial class RavenDBPublishing
     private static string BootstrapServiceName(string serverServiceName) => $"{serverServiceName}-bootstrap";
 
     /// <summary>
-    /// A POSIX shell script that creates the given databases if they do not exist.
+    /// A POSIX shell script that creates the given databases if they do not exist. The service starts once the
+    /// server is healthy, so the script does not wait for it.
     /// </summary>
     /// <remarks>
     /// The script contains no shell variables, because Docker Compose interpolates <c>$VAR</c> in the file.
@@ -285,12 +290,9 @@ internal static partial class RavenDBPublishing
     /// </remarks>
     internal static string BuildBootstrapScript(string serverUrl, IEnumerable<string> databases)
     {
-        var script = new StringBuilder()
-            .Append("set -e; ")
-            .Append(CultureInfo.InvariantCulture, $"echo 'ravendb-bootstrap: waiting for {serverUrl}'; ")
-            .Append(CultureInfo.InvariantCulture, $"until curl -sf {serverUrl}{ReadinessPath} >/dev/null 2>&1; do sleep 2; done; ");
+        var script = new StringBuilder().Append("set -e; ");
 
-        foreach (var database in databases.Distinct(StringComparer.Ordinal))
+        foreach (var database in databases)
         {
             EnsureValidDatabaseName(database);
 
@@ -336,6 +338,7 @@ internal static partial class RavenDBPublishing
             Action = context =>
             {
                 Validate(server, context.Logger);
+                EnsureCertificateFilesAreMounted(context.Model, server);
                 WarnAboutMissingCertificateFiles(context.Model, server, context.Logger);
                 return Task.CompletedTask;
             },
@@ -346,7 +349,7 @@ internal static partial class RavenDBPublishing
         return step;
     }
 
-    internal static void Validate(RavenDBServerResource server, ILogger logger)
+    private static void Validate(RavenDBServerResource server, ILogger logger)
     {
         if (server.ExternalUrl is not null)
         {
@@ -375,9 +378,8 @@ internal static partial class RavenDBPublishing
 
             var message =
                 $"RavenDB server '{server.Name}' targets '{target.ComputeEnvironment!.Name}', whose only persistent " +
-                "storage is Azure Files over SMB or NFS. RavenDB does not support network file systems " +
-                $"({DeploymentConsiderationsUrl}); data gets corrupted or lost ({AzureContainerAppsArticleUrl}). " +
-                "Use RavenDB Cloud for applications hosted there.";
+                "storage is Azure Files over SMB or NFS. RavenDB does not support network file systems, on which data " +
+                $"gets corrupted or lost ({DeploymentConsiderationsUrl}). Use RavenDB Cloud for applications hosted there.";
 
             if (HasPersistentData(server))
             {
@@ -385,6 +387,20 @@ internal static partial class RavenDBPublishing
             }
 
             logger.LogWarning("{Message} Without a data volume the server is ephemeral: its data is lost on every restart.", message);
+        }
+
+        // Only the Docker Compose bootstrap creates them for a server deployed as a container.
+        if (server.DatabasesToCreate.Count > 0 &&
+            server.Annotations.OfType<DeploymentTargetAnnotation>().FirstOrDefault()?.ComputeEnvironment is { } environment &&
+            environment is not DockerComposeEnvironmentResource)
+        {
+            logger.LogWarning(
+                "RavenDB server '{Server}' is deployed to '{Environment}', where the databases declared with ensureCreated " +
+                "({Databases}) are not created: only Docker Compose, PublishAsRavenDBCluster and PublishAsRavenDBCloud " +
+                "create them. Create them once the server runs.",
+                server.Name,
+                environment.Name,
+                string.Join(", ", server.DatabasesToCreate));
         }
 
         if (server.HasLiteralLicense)
@@ -402,6 +418,25 @@ internal static partial class RavenDBPublishing
                 "at the configured path (for example through WithBindMount), and databases declared with " +
                 "ensureCreated are not created in deployed environments yet.",
                 server.Name);
+        }
+    }
+
+    /// <summary>
+    /// Only Docker Compose mounts a certificate file: an application deployed anywhere else would start without one.
+    /// </summary>
+    private static void EnsureCertificateFilesAreMounted(DistributedApplicationModel model, RavenDBServerResource server)
+    {
+        foreach (var consumer in RavenDBConsumers.Find(model, server))
+        {
+            if (consumer.OwnCertificate(RavenDBClientCertificateSource.File) is not null &&
+                consumer.Resource.Annotations.OfType<DeploymentTargetAnnotation>().FirstOrDefault()?.ComputeEnvironment is { } environment &&
+                environment is not DockerComposeEnvironmentResource)
+            {
+                throw new DistributedApplicationException(
+                    $"'{consumer.Resource.Name}' brings its certificate for RavenDB server '{server.Name}' as a file, which " +
+                    $"only Docker Compose mounts, but is deployed to '{environment.Name}'. In Kubernetes, use " +
+                    "WithRavenDBClientCertificateSecret from CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes.");
+            }
         }
     }
 

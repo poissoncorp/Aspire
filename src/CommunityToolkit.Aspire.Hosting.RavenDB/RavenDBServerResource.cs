@@ -1,4 +1,4 @@
-﻿using System.Security.Cryptography.X509Certificates;
+using System.Security.Cryptography.X509Certificates;
 
 #pragma warning disable ASPIREATS001 // AspireExport is experimental
 

@@ -80,7 +80,7 @@ public class RavenDBPublishTests(ITestOutputHelper output)
         var services = ReadComposeServices(tempDir.Path);
         var bootstrap = (YamlMappingNode)services["ravendb-bootstrap"];
 
-        Assert.Equal("docker.io/ravendb/ravendb:6.2-latest", bootstrap["image"].ToString());
+        Assert.Equal($"{RavenDBContainerImageTags.Registry}/{RavenDBContainerImageTags.Image}:{RavenDBContainerImageTags.Tag}", bootstrap["image"].ToString());
         Assert.Equal("/bin/sh", ((YamlSequenceNode)bootstrap["entrypoint"]).Children[0].ToString());
         Assert.Equal("service_healthy", bootstrap["depends_on"]["ravendb"]["condition"].ToString());
 
@@ -88,9 +88,6 @@ public class RavenDBPublishTests(ITestOutputHelper output)
         Assert.Contains("http://ravendb:8080/admin/databases?name=orders", script);
         Assert.Contains("http://ravendb:8080/admin/databases?name=catalog-db", script);
         Assert.DoesNotContain("reports", script);
-
-        // A database that could not be created fails the service.
-        Assert.Contains("creating database orders failed' >&2; exit 1", script);
     }
 
     [Fact]
@@ -327,7 +324,78 @@ public class RavenDBPublishTests(ITestOutputHelper output)
         builder.AddContainer("consumer", "busybox").WithRavenDBClientCertificateFile(orders, "consumer.pfx");
 
         using var app = builder.Build();
-        await Assert.ThrowsAsync<DistributedApplicationException>(() => app.RunAsync(TestContext.Current.CancellationToken));
+        var exception = await Assert.ThrowsAsync<DistributedApplicationException>(() => app.RunAsync(TestContext.Current.CancellationToken));
+        Assert.Contains("'consumer' has a client certificate for RavenDB server 'ravendb' but does not reference it", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CertificateFileIsMountedFromTheComposeDirectoryNextToOtherEnvironments()
+    {
+        using var tempDir = new TempDirectory();
+        using var builder = CreateForPublish(tempDir.Path);
+
+        // With a second compute environment of any kind, Aspire writes the compose file to a directory of its own.
+        builder.Configuration["Parameters:ravendb-url"] = "https://a.ravendb.example.com";
+        var compose = builder.AddDockerComposeEnvironment("compose");
+        builder.AddKubernetesEnvironment("k8s");
+        var orders = builder.AddRavenDB("ravendb").WithComputeEnvironment(compose).PublishAsExisting(builder.AddParameter("ravendb-url")).AddDatabase("orders");
+
+        builder.AddContainer("consumer", "busybox")
+            .WithComputeEnvironment(compose)
+            .WithReference(orders)
+            .WithRavenDBClientCertificateFile(orders, "certs/consumer.pfx");
+
+        using var app = builder.Build();
+        await app.RunAsync(TestContext.Current.CancellationToken);
+
+        var composeDirectory = Path.Combine(tempDir.Path, "compose");
+        var yaml = new YamlStream();
+        yaml.Load(new StringReader(File.ReadAllText(Path.Combine(composeDirectory, "docker-compose.yaml"))));
+        var file = ((YamlMappingNode)yaml.Documents[0].RootNode)["secrets"]["ravendb-ravendb--consumer-certificate"]["file"].ToString();
+
+        Assert.Equal(Path.GetFullPath("certs/consumer.pfx", builder.AppHostDirectory), Path.GetFullPath(file, composeDirectory));
+    }
+
+    [Fact]
+    public async Task CertificateFileOfAnApplicationOutsideDockerComposeIsRejected()
+    {
+        using var tempDir = new TempDirectory();
+        using var builder = CreateForPublish(tempDir.Path);
+        var logs = CaptureLogs(builder);
+
+        builder.Configuration["Parameters:ravendb-url"] = "https://a.ravendb.example.com";
+        builder.AddKubernetesEnvironment("k8s");
+        var orders = builder.AddRavenDB("ravendb").PublishAsExisting(builder.AddParameter("ravendb-url")).AddDatabase("orders");
+        builder.AddContainer("consumer", "busybox").WithReference(orders).WithRavenDBClientCertificateFile(orders, "certs/consumer.pfx");
+
+        using var app = builder.Build();
+        await app.RunAsync(TestContext.Current.CancellationToken);
+
+        AssertPublishFailed(logs, "only Docker Compose mounts, but is deployed to 'k8s'");
+    }
+
+    [Fact]
+    public async Task DatabasesAServerOutsideDockerComposeDoesNotCreateAreReported()
+    {
+        using var tempDir = new TempDirectory();
+        using var builder = CreateForPublish(tempDir.Path);
+        var logs = CaptureLogs(builder);
+
+        builder.AddKubernetesEnvironment("k8s");
+        builder.AddRavenDB("ravendb").AddDatabase("orders", ensureCreated: true);
+
+        using var app = builder.Build();
+        await app.RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Contains(logs.Entries, e => e.Level == LogLevel.Warning && e.Text.Contains("deployed to 'k8s', where the databases declared with ensureCreated (orders) are not created", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void AzureEnvironmentsWithNetworkStorageAreKnownByTheirTypeNames()
+    {
+        // The validation matches them by name, to keep the Azure packages out of this one's dependencies.
+        Assert.Equal("AzureContainerAppEnvironmentResource", typeof(global::Aspire.Hosting.Azure.AppContainers.AzureContainerAppEnvironmentResource).Name);
+        Assert.Equal("AzureAppServiceEnvironmentResource", typeof(global::Aspire.Hosting.Azure.AzureAppServiceEnvironmentResource).Name);
     }
 
     [Fact]
@@ -398,13 +466,11 @@ public class RavenDBPublishTests(ITestOutputHelper output)
     [Fact]
     public void BootstrapScriptHasNoShellVariables()
     {
-        var script = RavenDBPublishing.BuildBootstrapScript("http://ravendb:8080", ["orders", "orders", "catalog-db"]);
+        var script = RavenDBPublishing.BuildBootstrapScript("http://ravendb:8080", ["orders", "catalog-db"]);
 
-        // Docker Compose interpolates $VAR in the file, so the script must not rely on shell variables.
+        // Docker Compose interpolates $VAR in the file, so the script must not rely on shell variables. What it does is
+        // tested by running it (ComposeBootstrapScriptTests).
         Assert.DoesNotContain("$", script);
-        Assert.Equal(1, CountOccurrences(script, "name=orders&replicationFactor=1"));
-        Assert.Contains("if curl -sf 'http://ravendb:8080/databases?name=catalog-db'", script);
-        Assert.EndsWith("echo 'ravendb-bootstrap: done'", script);
     }
 
     [Fact]
@@ -449,17 +515,6 @@ public class RavenDBPublishTests(ITestOutputHelper output)
         return (YamlMappingNode)((YamlMappingNode)yaml.Documents[0].RootNode)["services"];
     }
 
-    private static int CountOccurrences(string text, string value)
-    {
-        var count = 0;
-
-        for (var index = text.IndexOf(value, StringComparison.Ordinal); index >= 0; index = text.IndexOf(value, index + value.Length, StringComparison.Ordinal))
-        {
-            count++;
-        }
-
-        return count;
-    }
 
     private sealed class CapturingLoggerProvider(ITestOutputHelper output) : ILoggerProvider
     {

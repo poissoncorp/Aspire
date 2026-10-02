@@ -37,7 +37,7 @@ With a Docker Compose environment in the AppHost, the published `docker-compose.
 
 - an HTTP health check on the RavenDB service (`/build/version`) for unsecured servers;
 - `condition: service_healthy` for every resource that waits for the server;
-- a one-shot `<name>-bootstrap` service that creates the databases added with `ensureCreated: true`, the same databases the AppHost creates locally. Running it again leaves existing databases untouched. The applications that use the server start once it has completed; a database it cannot create fails it, and with it those applications.
+- a one-shot `<name>-bootstrap` service that creates the databases added with `ensureCreated: true`, the same databases the AppHost creates locally. Running it again leaves existing databases untouched. The applications that wait for the server (`WaitFor`) start once it has completed; a database it cannot create fails it, and with it those applications.
 
 ```csharp
 builder.AddDockerComposeEnvironment("compose");
