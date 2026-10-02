@@ -7,12 +7,18 @@
 
   <ItemGroup>
     <PackageReference Include="Aspire.Hosting" />
+    <PackageReference Include="Aspire.Hosting.Docker" />
     <PackageReference Include="AspNetCore.HealthChecks.RavenDB" />
     <PackageReference Include="MessagePack" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Tests" />
+    <!-- Sibling packages released together with this one plug their publish strategies into the server resource. -->
+    <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Cloud" />
+    <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.Tests" />
+    <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes" />
+    <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Kubernetes.Tests" />
   </ItemGroup>
 
 </Project>

@@ -23,16 +23,33 @@ namespace Aspire.Hosting
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> AddRavenDB(this IDistributedApplicationBuilder builder, string name) { throw null; }
 
         [AspireExport]
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> PublishAsExisting(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> url) { throw null; }
+
+        [AspireExport]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> WithDataBindMount(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, string source, bool isReadOnly = false) { throw null; }
 
         [AspireExport]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> WithDataVolume(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, string? name = null, bool isReadOnly = false) { throw null; }
 
         [AspireExport]
+        public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> WithLicense(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, ApplicationModel.IResourceBuilder<ApplicationModel.ParameterResource> license, bool eulaAccepted = true) { throw null; }
+
+        [AspireExport]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> WithLogBindMount(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, string source, bool isReadOnly = false) { throw null; }
 
         [AspireExport]
         public static ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> WithLogVolume(this ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> builder, string? name = null, bool isReadOnly = false) { throw null; }
+    }
+
+    public static partial class RavenDBClientCertificateExtensions
+    {
+        [AspireExportIgnore(Reason = "Polyglot app hosts pass the server: ATS allows one export per member name and target type.")]
+        public static ApplicationModel.IResourceBuilder<T> WithRavenDBClientCertificateFile<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBDatabaseResource> database, string path, string? certificateAuthority = null)
+            where T : ApplicationModel.IComputeResource { throw null; }
+
+        [AspireExport("withRavenDBServerClientCertificateFile", MethodName = "withRavenDBClientCertificateFile")]
+        public static ApplicationModel.IResourceBuilder<T> WithRavenDBClientCertificateFile<T>(this ApplicationModel.IResourceBuilder<T> builder, ApplicationModel.IResourceBuilder<ApplicationModel.RavenDBServerResource> server, string path, string? certificateAuthority = null)
+            where T : ApplicationModel.IComputeResource { throw null; }
     }
 }
 

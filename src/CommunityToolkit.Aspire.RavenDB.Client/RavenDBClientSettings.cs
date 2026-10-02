@@ -77,6 +77,19 @@ public sealed class RavenDBClientSettings
             return null;
         }
 
+        // A file this process may not read (a key file kept at mode 0600 by another user, a missing mount) otherwise
+        // fails inside OpenSSL with a message that names neither the file nor the cause.
+        try
+        {
+            using var _ = File.OpenRead(CertificatePath);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidOperationException(
+                $"The RavenDB client certificate '{CertificatePath}' cannot be read: {exception.Message} It has to exist and be readable by this process's user.",
+                exception);
+        }
+
 #pragma warning disable SYSLIB0057
         return new X509Certificate2(CertificatePath, CertificatePassword);
 #pragma warning restore SYSLIB0057

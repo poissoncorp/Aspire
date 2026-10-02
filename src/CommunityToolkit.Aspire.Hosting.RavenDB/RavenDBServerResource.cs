@@ -66,6 +66,9 @@ public class RavenDBServerResource(string name, bool isSecured) : ContainerResou
     {
         get
         {
+            if (ExternalUrl is { } externalUrl)
+                return ReferenceExpression.Create($"URL={externalUrl}");
+
             if (IsSecured && !string.IsNullOrEmpty(PublicServerUrl))
                 return ReferenceExpression.Create($"URL={PublicServerUrl}");
 
@@ -80,9 +83,34 @@ public class RavenDBServerResource(string name, bool isSecured) : ContainerResou
     /// <remarks>
     /// Format: <c>http://{host}:{port}</c> or <c>https://{host}:{port}</c> depending on security settings.
     /// </remarks>
-    public ReferenceExpression UriExpression => ReferenceExpression.Create($"{(IsSecured ? "https://" : "http://")}{Host}:{Port}");
+    public ReferenceExpression UriExpression => ExternalUrl ?? ReferenceExpression.Create($"{(IsSecured ? "https://" : "http://")}{Host}:{Port}");
+
+    /// <summary>
+    /// Where consumers connect when the server is not deployed as a container in publish mode: an existing server,
+    /// a RavenDB Cloud product, a cluster run by the operator. <see langword="null"/> means the container itself.
+    /// </summary>
+    /// <remarks>
+    /// While it is set, nothing the resource exposes refers to its container endpoints. A compute environment that
+    /// no longer contains the container would otherwise fail to resolve them.
+    /// </remarks>
+    internal ReferenceExpression? ExternalUrl { get; private set; }
+
+    /// <summary>
+    /// Takes the server out of the published artifacts and points its consumers at <paramref name="url"/>.
+    /// </summary>
+    internal void PublishAsExternal(ReferenceExpression url, bool createsDatabases = false)
+    {
+        ExternalUrl = url;
+        CreatesDatabasesWhenExternal = createsDatabases;
+    }
+
+    /// <summary>
+    /// Whether the strategy that published the server as external creates the <see cref="DatabasesToCreate"/> itself.
+    /// </summary>
+    internal bool CreatesDatabasesWhenExternal { get; private set; }
 
     private readonly Dictionary<string, string> _databases = new();
+    private readonly HashSet<string> _databasesToCreate = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Gets a read-only dictionary of databases associated with this server resource.
@@ -91,17 +119,48 @@ public class RavenDBServerResource(string name, bool isSecured) : ContainerResou
     public IReadOnlyDictionary<string, string> Databases => _databases;
 
     /// <summary>
+    /// Names of the databases declared with <c>ensureCreated: true</c>. They are created by the AppHost in run
+    /// mode and by a bootstrap workload in the published artifacts.
+    /// </summary>
+    internal IReadOnlyCollection<string> DatabasesToCreate => _databasesToCreate;
+
+    /// <summary>
+    /// Whether the license was supplied as a literal string (settings or environment dictionary), which ends up
+    /// inlined in published artifacts. Cleared by <c>WithLicense(parameter)</c>.
+    /// </summary>
+    internal bool HasLiteralLicense { get; set; }
+
+    /// <summary>
+    /// The parameter given to <c>WithLicense(parameter)</c>, for strategies that deliver the license another way
+    /// than through the container's environment.
+    /// </summary>
+    internal ParameterResource? LicenseParameter { get; set; }
+
+    /// <summary>
     /// Adds a database to the resource.
     /// </summary>
     /// <param name="name">The name of the resource to associate with the database.</param>
     /// <param name="databaseName">The name of the database to add.</param>
-    internal void AddDatabase(string name, string databaseName)
+    /// <param name="ensureCreated">Whether the database is created when the server starts.</param>
+    internal void AddDatabase(string name, string databaseName, bool ensureCreated)
     {
         _databases.TryAdd(name, databaseName);
+
+        if (ensureCreated)
+        {
+            _databasesToCreate.Add(databaseName);
+        }
     }
 
     IEnumerable<KeyValuePair<string, ReferenceExpression>> IResourceWithConnectionString.GetConnectionProperties()
     {
+        if (ExternalUrl is { } externalUrl)
+        {
+            // Host and port are not known separately for an external server.
+            yield return new("Uri", externalUrl);
+            yield break;
+        }
+
         yield return new("Host", ReferenceExpression.Create($"{Host}"));
         yield return new("Port", ReferenceExpression.Create($"{Port}"));
         yield return new("Uri", UriExpression);
