@@ -3,6 +3,7 @@
 
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Pipelines;
+using CommunityToolkit.Aspire.Utils;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -60,7 +61,7 @@ internal static class BitwardenSecretManagerDeploymentStep
 
         if (bitwarden.ProjectId is Guid projectId)
         {
-            patches[ToEnvKey($"{{{bitwarden.Name}.projectId}}")] = projectId.ToString("D");
+            patches[ComposeEnvironmentVariables.NameOf($"{{{bitwarden.Name}.projectId}}")] = projectId.ToString("D");
         }
 
         foreach (var secret in bitwarden.ManagedSecrets)
@@ -68,12 +69,12 @@ internal static class BitwardenSecretManagerDeploymentStep
             string? secretValue = bitwarden.ResolveSecretValue(secret);
             if (secretValue is not null)
             {
-                patches[ToEnvKey($"{{{bitwarden.Name}.secrets.{secret.RemoteName}}}")] = secretValue;
+                patches[ComposeEnvironmentVariables.NameOf($"{{{bitwarden.Name}.secrets.{secret.RemoteName}}}")] = secretValue;
             }
 
             if (secret.SecretId is Guid secretId)
             {
-                patches[ToEnvKey($"{{{bitwarden.Name}.secrets.{secret.RemoteName}.id}}")] = secretId.ToString("D");
+                patches[ComposeEnvironmentVariables.NameOf($"{{{bitwarden.Name}.secrets.{secret.RemoteName}.id}}")] = secretId.ToString("D");
             }
         }
 
@@ -87,12 +88,12 @@ internal static class BitwardenSecretManagerDeploymentStep
             string? secretValue = bitwarden.ResolveSecretValue(secretRef);
             if (secretValue is not null)
             {
-                patches[ToEnvKey($"{{{bitwarden.Name}.secrets.{secretRef.RemoteName}}}")] = secretValue;
+                patches[ComposeEnvironmentVariables.NameOf($"{{{bitwarden.Name}.secrets.{secretRef.RemoteName}}}")] = secretValue;
             }
 
             if (secretRef.ResolvedSecretId is Guid secretId)
             {
-                patches[ToEnvKey($"{{{bitwarden.Name}.secrets.{secretRef.RemoteName}.id}}")] = secretId.ToString("D");
+                patches[ComposeEnvironmentVariables.NameOf($"{{{bitwarden.Name}.secrets.{secretRef.RemoteName}.id}}")] = secretId.ToString("D");
             }
         }
 
@@ -135,10 +136,4 @@ internal static class BitwardenSecretManagerDeploymentStep
             await File.WriteAllLinesAsync(envFilePath, lines).ConfigureAwait(false);
         }
     }
-
-    private static string ToEnvKey(string valueExpression) =>
-        valueExpression
-            .Replace("{", "").Replace("}", "")
-            .Replace(".", "_").Replace("-", "_")
-            .ToUpperInvariant();
 }

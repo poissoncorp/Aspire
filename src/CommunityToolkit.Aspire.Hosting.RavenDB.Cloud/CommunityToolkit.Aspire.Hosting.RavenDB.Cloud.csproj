@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Deploys the Aspire RavenDB integration to RavenDB Cloud: aspire deploy creates or adopts a RavenDB Cloud product and connects the application to it.</Description>
+    <AdditionalPackageTags>hosting ravendb cloud deployment</AdditionalPackageTags>
+    <!-- Built on Aspire's pipeline APIs, which are still experimental. -->
+    <IsPreview>true</IsPreview>
+    <NoWarn>$(NoWarn);ASPIREPIPELINES001;ASPIREPIPELINES002;ASPIREPIPELINES004</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting" />
+    <PackageReference Include="Aspire.Hosting.Docker" />
+    <PackageReference Include="RavenDB.Client" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CommunityToolkit.Aspire.Hosting.RavenDB\CommunityToolkit.Aspire.Hosting.RavenDB.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="$(SharedDir)\ComposeEnvironmentVariables.cs" Link="Utils\ComposeEnvironmentVariables.cs" />
+    <Compile Include="$(SharedDir)\MatchingPackageVersion.cs" Link="Utils\MatchingPackageVersion.cs" />
+  </ItemGroup>
+
+</Project>
