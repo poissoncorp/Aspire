@@ -28,6 +28,13 @@ internal sealed class RavenDBCloudDeployment : IResourceAnnotation
         ProductName = options.ProductName ?? $"{appHostName}-{server.Name}-{environmentName}".Replace('.', '-').ToLowerInvariant();
         Subdomain = options.Subdomain ?? DeriveSubdomain(ProductName);
         Endpoint = new RavenDBCloudEndpoint(server.Name);
+
+        // Only AWS has a region to assume; elsewhere a guess would fail once the product is created.
+        Region = options.Region ?? (options.Provider == RavenDBCloudProvider.Aws
+            ? "us-east-1"
+            : throw new ArgumentException(
+                $"Set Region for RavenDB Cloud server '{server.Name}': there is no default region on {options.Provider}.",
+                nameof(options)));
     }
 
     /// <summary>The longest subdomain RavenDB Cloud accepts.</summary>
@@ -38,6 +45,9 @@ internal sealed class RavenDBCloudDeployment : IResourceAnnotation
     public ParameterResource ApiKey { get; }
 
     public RavenDBCloudOptions Options { get; }
+
+    /// <summary>The provider region the product is created in.</summary>
+    public string Region { get; }
 
     /// <summary>The AppHost the product and the applications' certificates are named after.</summary>
     public string AppHostName { get; }
@@ -92,7 +102,7 @@ internal sealed class RavenDBCloudDeployment : IResourceAnnotation
     /// <summary>Delay between two status checks while a product is being created; shortened in tests.</summary>
     public TimeSpan PollInterval { get; set; } = TimeSpan.FromSeconds(10);
 
-    /// <summary>Deployment state section holding the product id and URL between deployments.</summary>
+    /// <summary>Deployment state section holding the id of the product this deployment created.</summary>
     public string StateSectionName => $"ravendb-cloud.{Server.Name}";
 }
 

@@ -52,8 +52,8 @@ public sealed class RavenDBCloudOptions
 {
     /// <summary>
     /// Display name of the product in the account. Defaults to
-    /// <c>&lt;AppHost&gt;-&lt;resource name&gt;-&lt;environment&gt;</c>, so every AppHost and every environment get a product
-    /// of their own.
+    /// <c>&lt;AppHost&gt;-&lt;resource name&gt;-&lt;environment&gt;</c>, where the AppHost is the name of its project (C#) or of
+    /// its package in <c>package.json</c> (TypeScript), so every AppHost and every environment get a product of their own.
     /// </summary>
     public string? ProductName { get; set; }
 
@@ -67,8 +67,11 @@ public sealed class RavenDBCloudOptions
     /// <summary>Cloud provider. Default: <see cref="RavenDBCloudProvider.Aws"/>.</summary>
     public RavenDBCloudProvider Provider { get; set; } = RavenDBCloudProvider.Aws;
 
-    /// <summary>Provider region. Default: <c>us-east-1</c>.</summary>
-    public string Region { get; set; } = "us-east-1";
+    /// <summary>
+    /// Provider region, such as <c>us-east-1</c> on AWS or <c>westeurope</c> on Azure. Default: <c>us-east-1</c> on AWS;
+    /// required on the other providers.
+    /// </summary>
+    public string? Region { get; set; }
 
     /// <summary>Product tier. Default: <see cref="RavenDBCloudTier.Development"/>.</summary>
     public RavenDBCloudTier Tier { get; set; } = RavenDBCloudTier.Development;

@@ -35,7 +35,7 @@ namespace CommunityToolkit.Aspire.Hosting.RavenDB.Cloud
         [global::Aspire.Hosting.AspireExportIgnore(Reason = "A TimeSpan reaches polyglot app hosts as a number without a unit.")]
         public System.TimeSpan ProvisioningTimeout { get { throw null; } set { } }
 
-        public string Region { get { throw null; } set { } }
+        public string? Region { get { throw null; } set { } }
 
         public string? ReleaseChannel { get { throw null; } set { } }
 

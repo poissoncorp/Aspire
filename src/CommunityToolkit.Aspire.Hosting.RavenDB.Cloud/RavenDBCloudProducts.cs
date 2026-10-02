@@ -192,7 +192,7 @@ internal sealed class RavenDBCloudProducts(RavenDBCloudApiClient client, IDeploy
 
         if (instanceType is null || diskSize is null)
         {
-            var types = await client.GetInstanceTypesAsync(provider, options.Region, cancellationToken).ConfigureAwait(false);
+            var types = await client.GetInstanceTypesAsync(provider, deployment.Region, cancellationToken).ConfigureAwait(false);
 
             var chosen = instanceType is not null
                 ? types.FirstOrDefault(t => string.Equals(t.Name, instanceType, StringComparison.OrdinalIgnoreCase))
@@ -204,7 +204,7 @@ internal sealed class RavenDBCloudProducts(RavenDBCloudApiClient client, IDeploy
 
             instanceType ??= chosen?.Name
                 ?? throw new InvalidOperationException(
-                    $"RavenDB Cloud offers no {options.Tier} instance type in {provider} {options.Region}. Set InstanceType or pick another region.");
+                    $"RavenDB Cloud offers no {options.Tier} instance type in {provider} {deployment.Region}. Set InstanceType or pick another region.");
 
             diskSize ??= chosen?.Parameters?.AvailableDiskSizes?.Where(s => s > 0).DefaultIfEmpty().Min() is int smallest and > 0
                 ? smallest
@@ -229,7 +229,7 @@ internal sealed class RavenDBCloudProducts(RavenDBCloudApiClient client, IDeploy
             ReleaseChannel: releaseChannel,
             SubdomainName: deployment.Subdomain,
             Tier: options.Tier.ToString(),
-            Region: options.Region,
+            Region: deployment.Region,
             DiskSize: diskSize.Value,
             StorageTypeName: options.StorageType.ToString(),
             AllowedIps: [.. options.AllowedIps]);

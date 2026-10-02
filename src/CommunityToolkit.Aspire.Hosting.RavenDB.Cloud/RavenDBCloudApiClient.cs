@@ -39,13 +39,17 @@ internal sealed class RavenDBCloudApiClient : IDisposable
         _ownsHttpClient = ownsHttpClient;
 
         _http.BaseAddress = new Uri(endpoint.TrimEnd('/') + "/");
-        _http.Timeout = TimeSpan.FromSeconds(100);
         _http.DefaultRequestHeaders.Add("X-Api-Key", apiKey);
         _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         // The Cloud API's gateway answers requests without a User-Agent, which HttpClient does not send, with 403.
         _http.DefaultRequestHeaders.UserAgent.Add(UserAgent);
     }
+
+    /// <summary>Delay before the first retry, doubled for each further one; shortened in tests.</summary>
+    internal TimeSpan RetryDelay { get; init; } = TimeSpan.FromSeconds(1);
+
+    private const int MaxAttempts = 5;
 
     internal static ProductInfoHeaderValue UserAgent { get; } = new(
         "CommunityToolkit.Aspire.Hosting.RavenDB.Cloud",
@@ -54,7 +58,7 @@ internal sealed class RavenDBCloudApiClient : IDisposable
     /// <summary>GET /api/v1/products/list.</summary>
     public async Task<IReadOnlyList<ProductListItem>> ListProductsAsync(CancellationToken cancellationToken)
     {
-        using var response = await _http.GetAsync("api/v1/products/list", cancellationToken).ConfigureAwait(false);
+        using var response = await GetAsync("api/v1/products/list", cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, "list products", cancellationToken).ConfigureAwait(false);
 
         var list = await response.Content.ReadFromJsonAsync<ProductListResponse>(s_json, cancellationToken).ConfigureAwait(false);
@@ -65,7 +69,7 @@ internal sealed class RavenDBCloudApiClient : IDisposable
     /// <summary>GET /api/v1/products/details/{id}; <see langword="null"/> when the product is gone.</summary>
     public async Task<ProductDetails?> GetProductAsync(string productId, CancellationToken cancellationToken)
     {
-        using var response = await _http.GetAsync($"api/v1/products/details/{Uri.EscapeDataString(productId)}", cancellationToken).ConfigureAwait(false);
+        using var response = await GetAsync($"api/v1/products/details/{Uri.EscapeDataString(productId)}", cancellationToken).ConfigureAwait(false);
 
         if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Gone)
         {
@@ -80,7 +84,8 @@ internal sealed class RavenDBCloudApiClient : IDisposable
     /// <summary>POST /api/v1/products/create; returns the new product id.</summary>
     public async Task<string> CreateProductAsync(ProductCreateRequest request, CancellationToken cancellationToken)
     {
-        using var response = await _http.PostAsJsonAsync("api/v1/products/create", request, s_json, cancellationToken).ConfigureAwait(false);
+        // Not retried on a server error: the product may have been created, and the next deployment finds it by name.
+        using var response = await SendAsync(() => Post("api/v1/products/create", request), idempotent: false, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, "create product", cancellationToken).ConfigureAwait(false);
 
         var created = await response.Content.ReadFromJsonAsync<ProductCreatedResponse>(s_json, cancellationToken).ConfigureAwait(false);
@@ -91,7 +96,7 @@ internal sealed class RavenDBCloudApiClient : IDisposable
     /// <summary>GET /api/v1/products/security/certificate/{id}: the client certificate bundle.</summary>
     public async Task<byte[]> GetClientCertificateAsync(string productId, CancellationToken cancellationToken)
     {
-        using var response = await _http.GetAsync($"api/v1/products/security/certificate/{Uri.EscapeDataString(productId)}", cancellationToken).ConfigureAwait(false);
+        using var response = await GetAsync($"api/v1/products/security/certificate/{Uri.EscapeDataString(productId)}", cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, "download the client certificate", cancellationToken).ConfigureAwait(false);
 
         return await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
@@ -100,10 +105,10 @@ internal sealed class RavenDBCloudApiClient : IDisposable
     /// <summary>POST /api/v1/products/terminate/{id}. A product that is already gone is not an error.</summary>
     public async Task TerminateProductAsync(string productId, CancellationToken cancellationToken)
     {
-        using var response = await _http.PostAsJsonAsync(
-            $"api/v1/products/terminate/{Uri.EscapeDataString(productId)}",
-            new TerminateProductRequest(HideInPortal: false),
-            s_json,
+        // Terminating twice changes nothing: a product already gone answers 404.
+        using var response = await SendAsync(
+            () => Post($"api/v1/products/terminate/{Uri.EscapeDataString(productId)}", new TerminateProductRequest(HideInPortal: false)),
+            idempotent: true,
             cancellationToken).ConfigureAwait(false);
 
         if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Gone)
@@ -117,7 +122,7 @@ internal sealed class RavenDBCloudApiClient : IDisposable
     /// <summary>GET /api/v1/metadata/instance-types/{provider}/{region}.</summary>
     public async Task<IReadOnlyList<InstanceTypeItem>> GetInstanceTypesAsync(string provider, string region, CancellationToken cancellationToken)
     {
-        using var response = await _http.GetAsync(
+        using var response = await GetAsync(
             $"api/v1/metadata/instance-types/{Uri.EscapeDataString(provider)}/{Uri.EscapeDataString(region)}",
             cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, "list instance types", cancellationToken).ConfigureAwait(false);
@@ -130,11 +135,51 @@ internal sealed class RavenDBCloudApiClient : IDisposable
     /// <summary>GET /api/v1/metadata/release-channels.</summary>
     public async Task<ReleaseChannelsResponse> GetReleaseChannelsAsync(CancellationToken cancellationToken)
     {
-        using var response = await _http.GetAsync("api/v1/metadata/release-channels", cancellationToken).ConfigureAwait(false);
+        using var response = await GetAsync("api/v1/metadata/release-channels", cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, "list release channels", cancellationToken).ConfigureAwait(false);
 
         return await response.Content.ReadFromJsonAsync<ReleaseChannelsResponse>(s_json, cancellationToken).ConfigureAwait(false)
             ?? new ReleaseChannelsResponse(null, null);
+    }
+
+    private Task<HttpResponseMessage> GetAsync(string path, CancellationToken cancellationToken) =>
+        SendAsync(() => new HttpRequestMessage(HttpMethod.Get, path), idempotent: true, cancellationToken);
+
+    private static HttpRequestMessage Post<T>(string path, T body) =>
+        new(HttpMethod.Post, path) { Content = JsonContent.Create(body, options: s_json) };
+
+    /// <summary>
+    /// The API accepts about one request per second and answers 429 beyond that. A 429 was not processed, so any
+    /// request is sent again; a server error or a lost connection only when sending it again changes nothing.
+    /// </summary>
+    private async Task<HttpResponseMessage> SendAsync(Func<HttpRequestMessage> request, bool idempotent, CancellationToken cancellationToken)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            HttpResponseMessage response;
+
+            try
+            {
+                using var message = request();
+                response = await _http.SendAsync(message, cancellationToken).ConfigureAwait(false);
+            }
+            catch (HttpRequestException) when (idempotent && attempt < MaxAttempts)
+            {
+                await Task.Delay(RetryDelay * Math.Pow(2, attempt - 1), cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            var retry = response.StatusCode == HttpStatusCode.TooManyRequests || (idempotent && (int)response.StatusCode >= 500);
+
+            if (!retry || attempt == MaxAttempts)
+            {
+                return response;
+            }
+
+            var delay = response.Headers.RetryAfter?.Delta ?? RetryDelay * Math.Pow(2, attempt - 1);
+            response.Dispose();
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private static async Task EnsureSuccessAsync(HttpResponseMessage response, string operation, CancellationToken cancellationToken)
@@ -188,8 +233,6 @@ internal sealed record ProductCreateRequest(
 internal sealed record ProductCreatedResponse(string? ProductId);
 
 internal sealed record ProductDetails(
-    string? Id,
-    string? DisplayName,
     string? Status,
     IReadOnlyList<string>? Dns,
     IReadOnlyList<string>? NodeTags);
@@ -209,9 +252,7 @@ internal sealed record ReleaseChannelItem(string? Name);
 /// <summary>Values of <c>ProductStatus</c>.</summary>
 internal static class ProductStatus
 {
-    public const string Creating = "Creating";
     public const string Active = "Active";
-    public const string DeployingChanges = "DeployingChanges";
     public const string Terminating = "Terminating";
     public const string Terminated = "Terminated";
     public const string Error = "Error";

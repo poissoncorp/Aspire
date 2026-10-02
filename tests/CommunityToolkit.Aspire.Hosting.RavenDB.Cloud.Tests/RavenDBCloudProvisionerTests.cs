@@ -394,6 +394,41 @@ public sealed class RavenDBCloudProvisionerTests : IDisposable
         Assert.False(File.Exists(CertificatePath("api")));
     }
 
+    [Fact]
+    public async Task BusyApiIsAskedAgain()
+    {
+        _api.AddProduct("test-ravendb-production");
+        _api.Failures.Enqueue(HttpStatusCode.TooManyRequests);
+        _api.Failures.Enqueue(HttpStatusCode.ServiceUnavailable);
+
+        await Provision(CreateDeployment());
+
+        Assert.Equal(["GET /api/v1/products/list", "GET /api/v1/products/list", "GET /api/v1/products/list"], _api.Requests.Take(3));
+    }
+
+    [Fact]
+    public async Task ProductCreationIsNotSentAgainAfterAServerError()
+    {
+        _api.FailCreation = HttpStatusCode.InternalServerError;
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => Provision(CreateDeployment(o => o.WithAllowedIps("203.0.113.0/24"))));
+
+        Assert.Contains("failed to create product: 500", exception.Message, StringComparison.Ordinal);
+        Assert.Single(_api.Requests, r => r == "POST /api/v1/products/create");
+    }
+
+    [Fact]
+    public async Task ProductCreationIsSentAgainWhenTheApiWasBusy()
+    {
+        var deployment = CreateDeployment(o => o.WithAllowedIps("203.0.113.0/24"));
+        _api.FailCreation = HttpStatusCode.TooManyRequests;
+
+        await Provision(deployment);
+
+        Assert.Equal(2, _api.Requests.Count(r => r == "POST /api/v1/products/create"));
+        Assert.Single(_api.CreateRequests);
+    }
+
     private string CertificateDirectory => Path.Combine(_output.FullName, "ravendb-certs");
 
     private async Task<RavenDBCloudDeployment> ProvisionedDeployment()

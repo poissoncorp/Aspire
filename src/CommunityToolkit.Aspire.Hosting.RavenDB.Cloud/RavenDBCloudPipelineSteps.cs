@@ -1,6 +1,7 @@
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Docker;
 using Aspire.Hosting.Pipelines;
+using CommunityToolkit.Aspire.Utils;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -62,7 +63,12 @@ internal static class RavenDBCloudPipelineSteps
             Name = ConfigureStepName(server),
             Description = $"Writes the RavenDB Cloud URL of '{server.Name}' into the generated environment files",
             Resource = server,
-            Action = context => PatchEnvironmentFilesAsync(deployment, context),
+            Action = context => PatchEnvironmentFilesAsync(
+                deployment,
+                context.Model,
+                context.Services.GetRequiredService<IPipelineOutputService>(),
+                context.Logger,
+                context.CancellationToken),
         };
         configure.DependsOn(provision);
         configure.RequiredBy(WellKnownPipelineSteps.Deploy);
@@ -102,7 +108,7 @@ internal static class RavenDBCloudPipelineSteps
     /// </summary>
     public static void Configure(RavenDBCloudDeployment deployment, PipelineConfigurationContext context)
     {
-        RejectApplicationsOnKubernetes(deployment, context);
+        RejectApplicationsOutsideDockerCompose(deployment, context);
 
         var server = deployment.Server;
         var provision = context.Steps.FirstOrDefault(s => s.Name == ProvisionStepName(server));
@@ -117,60 +123,40 @@ internal static class RavenDBCloudPipelineSteps
             destroy?.DependsOn(WellKnownPipelineSteps.ProcessParameters);
         }
 
-        foreach (var environment in context.Model.Resources.OfType<IComputeEnvironmentResource>())
+        foreach (var environment in context.Model.Resources.OfType<DockerComposeEnvironmentResource>())
         {
             // Docker Compose writes its environment files in prepare-{env} and uses them in docker-compose-up-{env}:
             // the product URL and the certificate files have to land in between.
-            var prepareName = $"prepare-{environment.Name}";
+            var prepare = AspireSteps.Prepare(environment);
+            AspireSteps.Required(context, prepare);
+            configure?.DependsOn(prepare);
+            certificates?.DependsOn(prepare);
 
-            if (context.Steps.Any(s => s.Name == prepareName))
-            {
-                configure?.DependsOn(prepareName);
-                certificates?.DependsOn(prepareName);
-            }
-
-            var composeUp = context.Steps.FirstOrDefault(s => s.Name == $"docker-compose-up-{environment.Name}");
-            composeUp?.DependsOn(ConfigureStepName(server));
-            composeUp?.DependsOn(CertificatesStepName(server));
+            var composeUp = AspireSteps.Required(context, AspireSteps.ComposeUp(environment));
+            composeUp.DependsOn(ConfigureStepName(server));
+            composeUp.DependsOn(CertificatesStepName(server));
 
             // Stop the application before the product goes away.
-            var composeDownName = $"destroy-compose-{environment.Name}";
-
-            if (destroy is not null && context.Steps.Any(s => s.Name == composeDownName))
-            {
-                destroy.DependsOn(composeDownName);
-            }
-        }
-
-        // Azure Container Apps takes the URL as a Bicep parameter of each container app: the product must be known
-        // before those are provisioned.
-        foreach (var step in context.Steps)
-        {
-            if (step.Name.StartsWith("provision-", StringComparison.Ordinal) &&
-                step.Name.EndsWith("-containerapp", StringComparison.Ordinal))
-            {
-                step.DependsOn(ProvisionStepName(server));
-            }
+            destroy?.DependsOn(AspireSteps.Required(context, AspireSteps.ComposeDown(environment)));
         }
     }
 
     /// <summary>
-    /// A Kubernetes chart gets neither the product URL nor the applications' certificates yet, so an application
-    /// deployed there could not reach the product. Stopping here fails the pipeline before anything is provisioned.
+    /// Only Docker Compose gets the product URL and the applications' certificates, so an application deployed
+    /// anywhere else could not reach the product. Stopping here fails the pipeline before anything is provisioned.
     /// </summary>
-    private static void RejectApplicationsOnKubernetes(RavenDBCloudDeployment deployment, PipelineConfigurationContext context)
+    private static void RejectApplicationsOutsideDockerCompose(RavenDBCloudDeployment deployment, PipelineConfigurationContext context)
     {
         foreach (var consumer in RavenDBConsumers.Find(context.Model, deployment.Server))
         {
-            // Aspire's Kubernetes environments deploy through a helm-deploy-<environment> step.
             if (consumer.Resource.Annotations.OfType<DeploymentTargetAnnotation>().FirstOrDefault()?.ComputeEnvironment is { } environment &&
-                context.Steps.Any(s => s.Name == $"helm-deploy-{environment.Name}"))
+                environment is not DockerComposeEnvironmentResource)
             {
                 throw new InvalidOperationException(
-                    $"'{consumer.Resource.Name}' is deployed to Kubernetes ('{environment.Name}'), where this integration does not " +
-                    $"deliver the URL and certificate of RavenDB Cloud server '{deployment.Server.Name}' yet. Deploy " +
-                    $"'{consumer.Resource.Name}' with Docker Compose, or publish '{deployment.Server.Name}' with PublishAsExisting(url) " +
-                    "and mount the application's certificate with WithRavenDBClientCertificateSecret.");
+                    $"'{consumer.Resource.Name}' is deployed to '{environment.Name}', where this integration does not deliver " +
+                    $"the URL and certificate of RavenDB Cloud server '{deployment.Server.Name}': only Docker Compose gets " +
+                    $"them. Deploy '{consumer.Resource.Name}' with Docker Compose, or publish '{deployment.Server.Name}' with " +
+                    "PublishAsExisting(url) and give the application its certificate yourself.");
             }
         }
     }
@@ -182,23 +168,28 @@ internal static class RavenDBCloudPipelineSteps
     /// Docker Compose's prepare step only resolves parameters and container images, so a value that is only known
     /// at deploy time stays blank in <c>.env</c>. The Bitwarden integration works around the same gap.
     /// </remarks>
-    private static async Task PatchEnvironmentFilesAsync(RavenDBCloudDeployment deployment, PipelineStepContext context)
+    internal static async Task PatchEnvironmentFilesAsync(
+        RavenDBCloudDeployment deployment,
+        DistributedApplicationModel model,
+        IPipelineOutputService outputService,
+        ILogger logger,
+        CancellationToken cancellationToken)
     {
         if (deployment.Endpoint.Url is not { } url)
         {
             return;
         }
 
-        var environments = context.Model.Resources.OfType<IComputeEnvironmentResource>().ToList();
+        var environments = model.Resources.OfType<IComputeEnvironmentResource>().ToList();
 
         if (environments.Count == 0)
         {
             return;
         }
 
-        var outputService = context.Services.GetRequiredService<IPipelineOutputService>();
         var environmentName = deployment.EnvironmentName;
-        var key = ToEnvironmentVariableName(deployment.Endpoint.ValueExpression);
+        var key = ComposeEnvironmentVariables.NameOf(deployment.Endpoint.ValueExpression);
+        var written = false;
 
         foreach (var environment in environments)
         {
@@ -213,7 +204,7 @@ internal static class RavenDBCloudPipelineSteps
                     continue;
                 }
 
-                var lines = await File.ReadAllLinesAsync(path, context.CancellationToken).ConfigureAwait(false);
+                var lines = await File.ReadAllLinesAsync(path, cancellationToken).ConfigureAwait(false);
                 var changed = false;
 
                 for (var i = 0; i < lines.Length; i++)
@@ -229,10 +220,19 @@ internal static class RavenDBCloudPipelineSteps
 
                 if (changed)
                 {
-                    await File.WriteAllLinesAsync(path, lines, context.CancellationToken).ConfigureAwait(false);
-                    context.Logger.LogInformation("Wrote {Key} to {File}.", key, path);
+                    await File.WriteAllLinesAsync(path, lines, cancellationToken).ConfigureAwait(false);
+                    logger.LogInformation("Wrote {Key} to {File}.", key, path);
+                    written = true;
                 }
             }
+        }
+
+        // An application that uses the product would start with an empty URL.
+        if (!written && RavenDBConsumers.Find(model, deployment.Server).Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"Aspire wrote no {key} to the environment files of Docker Compose, so the applications would not get the URL of " +
+                $"RavenDB Cloud server '{deployment.Server.Name}'. This version of the integration does not support the Aspire version in use.");
         }
     }
 
@@ -265,21 +265,9 @@ internal static class RavenDBCloudPipelineSteps
 
         foreach (var consumer in RavenDBConsumers.Find(context.Model, server).Where(c => !c.BringsOwnCertificate))
         {
-            var target = consumer.Resource.Annotations.OfType<DeploymentTargetAnnotation>().FirstOrDefault()?.ComputeEnvironment;
-
-            if (target is not DockerComposeEnvironmentResource)
+            // Applications outside Docker Compose are rejected before the deployment starts.
+            if (consumer.Resource.Annotations.OfType<DeploymentTargetAnnotation>().FirstOrDefault()?.ComputeEnvironment is not DockerComposeEnvironmentResource target)
             {
-                if (target is not null)
-                {
-                    warnings?.LogWarning(
-                        "'{Resource}' is deployed to '{Environment}', which does not get a RavenDB client certificate from this " +
-                        "integration. Provide one for '{Server}' through Aspire:RavenDB:Client:{Connection}:CertificatePath.",
-                        consumer.Resource.Name,
-                        target.Name,
-                        server.Name,
-                        consumer.ConnectionNames[0]);
-                }
-
                 continue;
             }
 
@@ -303,15 +291,6 @@ internal static class RavenDBCloudPipelineSteps
 
         return new ClientCertificatePlan(prefix, directories, requests);
     }
-
-    /// <summary>How Docker Compose names the variable of a value expression: <c>{ravendb.url}</c> is <c>RAVENDB_URL</c>.</summary>
-    internal static string ToEnvironmentVariableName(string valueExpression) =>
-        valueExpression
-            .Replace("{", string.Empty, StringComparison.Ordinal)
-            .Replace("}", string.Empty, StringComparison.Ordinal)
-            .Replace('.', '_')
-            .Replace('-', '_')
-            .ToUpperInvariant();
 
     private static async Task<RavenDBCloudApiClient> CreateClientAsync(RavenDBCloudDeployment deployment, PipelineStepContext context)
     {

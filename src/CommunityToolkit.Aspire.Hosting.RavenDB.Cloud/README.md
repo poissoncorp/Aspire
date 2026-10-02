@@ -12,6 +12,8 @@ In your AppHost project, install the library with [NuGet](https://www.nuget.org)
 dotnet add package CommunityToolkit.Aspire.Hosting.RavenDB.Cloud
 ```
 
+Use it in the same version as `CommunityToolkit.Aspire.Hosting.RavenDB`: the two are released together, and a different version stops the AppHost with a message saying which one to install.
+
 ### Create an API key
 
 Create an API key in the RavenDB Cloud portal and pass it as a secret parameter, for example through the `Parameters__ravendb-cloud-api-key` environment variable in CI. The key has account-owner rights.
@@ -37,7 +39,7 @@ builder.AddProject<Projects.MyService>("api")
 
 `aspire deploy` then:
 
-1. looks the product up by name (`<AppHost>-<resource>-<environment>`, such as `shop-apphost-ravendb-production`, unless `ProductName` is set) and creates it when it does not exist, picking the smallest instance type of the tier, the smallest disk and the default release channel unless they are set. The node URLs get the subdomain `Subdomain`, derived from the name when unset (up to 13 letters, digits and dashes, unique in the account);
+1. looks the product up by name (`<AppHost>-<resource>-<environment>`, such as `shop-apphost-ravendb-production`, unless `ProductName` is set; the AppHost is its project's name, or for a TypeScript AppHost the `name` in its `package.json`) and creates it when it does not exist, picking the smallest instance type of the tier, the smallest disk and the default release channel unless they are set. `Region` defaults to `us-east-1` on AWS and has to be set on the other providers. The node URLs get the subdomain `Subdomain`, derived from the name when unset (up to 13 letters, digits and dashes, unique in the account);
 2. waits until the product is active;
 3. creates the databases declared with `ensureCreated: true`;
 4. issues a client certificate to each application that references the server or one of its databases (see below);
@@ -73,8 +75,8 @@ A product in your account with the configured name is used as it is, and `aspire
 
 ### Current limitations
 
-- Client certificates are delivered to applications deployed with Docker Compose. Elsewhere the deployment warns, and the application needs `Aspire:RavenDB:Client:<connection name>:CertificatePath` from another source.
-- The product URL is written into the environment files of Docker Compose and passed as a Bicep parameter in Azure Container Apps. An application deployed to Kubernetes gets neither the URL nor a certificate yet, so the deployment stops before it provisions anything. Reach the product from Kubernetes with `PublishAsExisting(url)` and the application's certificate mounted through `WithRavenDBClientCertificateSecret`.
+- The applications are deployed with Docker Compose: only there do they get the product URL and their certificates. An application deployed anywhere else, such as Kubernetes or Azure Container Apps, stops the deployment before it provisions anything. Reach the product from there with `PublishAsExisting(url)` and the certificate its owner issued (in Kubernetes, `WithRavenDBClientCertificateSecret`).
+- Requests the Cloud API turns away as too many (429) are sent again after a pause, as are reads that fail on the server's side; creating a product is not, so that a failure never creates a second one.
 - The Cloud API allows at most three products created through the API and about one request per second, so it is not meant for an environment per pull request.
 
 ## Feedback & contributing

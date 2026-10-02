@@ -1,3 +1,5 @@
+#pragma warning disable ASPIREPIPELINES004 // IPipelineOutputService is experimental
+
 using Aspire.Hosting;
 using Aspire.Hosting.Pipelines;
 using Aspire.Hosting.Utils;
@@ -193,7 +195,7 @@ public class RavenDBCloudPublishTests
 
         // Two AppHosts in one account, both with AddRavenDB("ravendb"), get products of their own.
         Assert.Equal("contoso-apphost-ravendb-staging", deployment.ProductName);
-        Assert.Equal("RAVENDB_URL", RavenDBCloudPipelineSteps.ToEnvironmentVariableName(deployment.Endpoint.ValueExpression));
+        Assert.Equal("RAVENDB_URL", CommunityToolkit.Aspire.Utils.ComposeEnvironmentVariables.NameOf(deployment.Endpoint.ValueExpression));
     }
 
     [Theory]
@@ -269,65 +271,162 @@ public class RavenDBCloudPublishTests
     }
 
     [Fact]
-    public void StepsAreOrderedAgainstTheComputeEnvironmentSteps()
+    public async Task StepsAreOrderedAgainstAspiresOwnSteps()
     {
-        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
-        builder.AddDockerComposeEnvironment("compose");
-        var deployment = CreateDeployment(builder, "Production");
+        var output = Directory.CreateTempSubdirectory(".ravendb-cloud-steps-test");
 
-        PipelineStep Placeholder(string name) => new() { Name = name, Action = _ => Task.CompletedTask };
-
-        var steps = RavenDBCloudPipelineSteps.Create(deployment)
-            .Concat([
-                Placeholder(WellKnownPipelineSteps.ProcessParameters),
-                Placeholder("prepare-compose"),
-                Placeholder("docker-compose-up-compose"),
-                Placeholder("destroy-compose-compose"),
-                Placeholder("provision-api-containerapp"),
-            ])
-            .ToDictionary(s => s.Name);
-
-        using var services = new ServiceCollection().BuildServiceProvider();
-
-        RavenDBCloudPipelineSteps.Configure(deployment, new PipelineConfigurationContext
+        try
         {
-            Services = services,
-            Steps = [.. steps.Values],
-            Model = new DistributedApplicationModel(builder.Resources),
-        });
+            using var builder = TestDistributedApplicationBuilder.Create(
+                "AppHost:Operation=publish", $"Pipeline:OutputPath={output.FullName}", "Pipeline:Step=publish");
+            builder.Configuration["Parameters:ravendb-cloud-api-key"] = "test-api-key";
+            builder.AddDockerComposeEnvironment("compose");
+            builder.AddRavenDB("ravendb").PublishAsRavenDBCloud(builder.AddParameter("ravendb-cloud-api-key", secret: true));
 
-        Assert.Contains(WellKnownPipelineSteps.ProcessParameters, steps["ravendb-cloud-provision-ravendb"].DependsOnSteps);
-        Assert.Contains("prepare-compose", steps["ravendb-cloud-configure-ravendb"].DependsOnSteps);
-        Assert.Contains("prepare-compose", steps["ravendb-cloud-certificates-ravendb"].DependsOnSteps);
-        Assert.Contains("ravendb-cloud-configure-ravendb", steps["docker-compose-up-compose"].DependsOnSteps);
-        Assert.Contains("ravendb-cloud-certificates-ravendb", steps["docker-compose-up-compose"].DependsOnSteps);
-        Assert.Contains("ravendb-cloud-provision-ravendb", steps["provision-api-containerapp"].DependsOnSteps);
+            // Registered after the server's: sees the steps as the server left them.
+            var steps = new Dictionary<string, IReadOnlyList<string>>();
+            builder.AddParameter("probe").WithPipelineConfiguration(context =>
+            {
+                foreach (var step in context.Steps)
+                {
+                    steps[step.Name] = [.. step.DependsOnSteps];
+                }
+            });
 
-        // The application stops before the product is terminated.
-        Assert.Contains("destroy-compose-compose", steps["ravendb-cloud-destroy-ravendb"].DependsOnSteps);
+            using var app = builder.Build();
+            await app.RunAsync(TestContext.Current.CancellationToken);
+
+            // Aspire's real steps, so a rename in Aspire fails here instead of leaving the steps unordered.
+            Assert.Contains(WellKnownPipelineSteps.ProcessParameters, steps["ravendb-cloud-provision-ravendb"]);
+            Assert.Contains("prepare-compose", steps["ravendb-cloud-configure-ravendb"]);
+            Assert.Contains("prepare-compose", steps["ravendb-cloud-certificates-ravendb"]);
+            Assert.Contains("ravendb-cloud-configure-ravendb", steps["docker-compose-up-compose"]);
+            Assert.Contains("ravendb-cloud-certificates-ravendb", steps["docker-compose-up-compose"]);
+
+            // The application stops before the product is terminated.
+            Assert.Contains("destroy-compose-compose", steps["ravendb-cloud-destroy-ravendb"]);
+        }
+        finally
+        {
+            output.Delete(recursive: true);
+        }
     }
 
-    [Fact]
-    public void ApplicationOnKubernetesIsRejectedBeforeAnythingIsProvisioned()
+    [Theory]
+    [InlineData("kubernetes")]
+    [InlineData("container-apps")]
+    public void ApplicationOutsideDockerComposeIsRejectedBeforeAnythingIsProvisioned(string target)
     {
         using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
-        var k8s = builder.AddKubernetesEnvironment("k8s");
+        IComputeEnvironmentResource environment = target == "kubernetes"
+            ? builder.AddKubernetesEnvironment("elsewhere").Resource
+            : builder.AddAzureContainerAppEnvironment("elsewhere").Resource;
         var deployment = CreateDeployment(builder, "Production");
 
         builder.AddContainer("api", "busybox")
             .WithReference(builder.CreateResourceBuilder(deployment.Server))
-            .WithAnnotation(new DeploymentTargetAnnotation(k8s.Resource) { ComputeEnvironment = k8s.Resource });
+            .WithAnnotation(new DeploymentTargetAnnotation(environment) { ComputeEnvironment = environment });
 
         using var services = new ServiceCollection().BuildServiceProvider();
 
         var exception = Assert.Throws<InvalidOperationException>(() => RavenDBCloudPipelineSteps.Configure(deployment, new PipelineConfigurationContext
         {
             Services = services,
-            Steps = [.. RavenDBCloudPipelineSteps.Create(deployment), new PipelineStep { Name = "helm-deploy-k8s", Action = _ => Task.CompletedTask }],
+            Steps = [.. RavenDBCloudPipelineSteps.Create(deployment)],
             Model = new DistributedApplicationModel(builder.Resources),
         }));
 
-        Assert.StartsWith("'api' is deployed to Kubernetes ('k8s')", exception.Message, StringComparison.Ordinal);
+        Assert.StartsWith("'api' is deployed to 'elsewhere', where this integration does not deliver", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UrlThatAspireWroteNoVariableForStopsTheDeployment()
+    {
+        var output = Directory.CreateTempSubdirectory(".ravendb-cloud-env-test");
+
+        try
+        {
+            using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+            builder.AddDockerComposeEnvironment("compose");
+            var deployment = CreateDeployment(builder, "Production");
+            deployment.Endpoint.Url = "https://a.contoso.ravendb.cloud";
+            builder.AddContainer("api", "busybox").WithReference(builder.CreateResourceBuilder(deployment.Server));
+
+            // As if Aspire had renamed the variable.
+            File.WriteAllText(Path.Combine(output.FullName, ".env"), "RAVENDB_ENDPOINT=\n");
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => RavenDBCloudPipelineSteps.PatchEnvironmentFilesAsync(
+                deployment,
+                new DistributedApplicationModel(builder.Resources),
+                new FixedOutputService(output.FullName),
+                Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance,
+                TestContext.Current.CancellationToken));
+
+            Assert.Contains("Aspire wrote no RAVENDB_URL", exception.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            output.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RegionHasADefaultOnAwsOnly()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        var apiKey = builder.AddParameter("cloud-key", secret: true);
+
+        Assert.Equal("us-east-1", CreateDeployment(builder, "Production").Region);
+
+        var exception = Assert.Throws<ArgumentException>(() => builder.AddRavenDB("azure").PublishAsRavenDBCloud(apiKey, cloud => cloud.Provider = RavenDBCloudProvider.Azure));
+        Assert.Contains("Set Region for RavenDB Cloud server 'azure': there is no default region on Azure.", exception.Message, StringComparison.Ordinal);
+
+        builder.AddRavenDB("westeurope").PublishAsRavenDBCloud(apiKey, cloud =>
+        {
+            cloud.Provider = RavenDBCloudProvider.Azure;
+            cloud.Region = "westeurope";
+        });
+    }
+
+    [Fact]
+    public void AppHostIsNamedAfterItsPackageOrItsProject()
+    {
+        var directory = Directory.CreateTempSubdirectory(".ravendb-cloud-apphost-test");
+
+        try
+        {
+            // A C# AppHost: its project's name, whatever folder the repository is checked out to.
+            Assert.Equal("Contoso.AppHost", RavenDBCloudBuilderExtensions.AppHostName(directory.FullName, "Contoso.AppHost"));
+
+            // A TypeScript AppHost, whose process is always aspire-managed: its package.
+            File.WriteAllText(Path.Combine(directory.FullName, "package.json"), """{"name":"@contoso/shop-apphost","private":true}""");
+            Assert.Equal("contoso-shop-apphost", RavenDBCloudBuilderExtensions.AppHostName(directory.FullName, "aspire-managed"));
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void PackageOfAnotherVersionIsRejectedBeforeItsInternalsAreReached()
+    {
+        // Built together, these two match.
+        CommunityToolkit.Aspire.Utils.MatchingPackageVersion.Ensure(typeof(RavenDBServerResource), typeof(RavenDBCloudOptions));
+
+        var exception = Assert.Throws<InvalidOperationException>(() => CommunityToolkit.Aspire.Utils.MatchingPackageVersion.Ensure(typeof(string), typeof(RavenDBCloudOptions)));
+        Assert.Contains("Install the same version of both packages", exception.Message, StringComparison.Ordinal);
+    }
+
+    private sealed class FixedOutputService(string directory) : IPipelineOutputService
+    {
+        public string GetOutputDirectory() => directory;
+
+        public string GetOutputDirectory(IResource resource) => Path.Combine(directory, resource.Name);
+
+        public string GetTempDirectory() => Path.GetTempPath();
+
+        public string GetTempDirectory(IResource resource) => Path.Combine(Path.GetTempPath(), resource.Name);
     }
 
     private static RavenDBCloudDeployment CreateDeployment(string environmentName) =>

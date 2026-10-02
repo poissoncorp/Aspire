@@ -22,4 +22,9 @@
     <InternalsVisibleTo Include="CommunityToolkit.Aspire.Hosting.RavenDB.Cloud.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="$(SharedDir)\ComposeEnvironmentVariables.cs" Link="Utils\ComposeEnvironmentVariables.cs" />
+    <Compile Include="$(SharedDir)\MatchingPackageVersion.cs" Link="Utils\MatchingPackageVersion.cs" />
+  </ItemGroup>
+
 </Project>

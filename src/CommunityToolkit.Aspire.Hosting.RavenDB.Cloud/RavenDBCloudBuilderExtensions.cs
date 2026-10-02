@@ -1,10 +1,13 @@
 #pragma warning disable ASPIREATS001 // AspireExport is experimental
 
+using System.Runtime.CompilerServices;
+using System.Text.Json.Nodes;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Docker;
 using Aspire.Hosting.Pipelines;
 using CommunityToolkit.Aspire.Hosting.RavenDB;
 using CommunityToolkit.Aspire.Hosting.RavenDB.Cloud;
+using CommunityToolkit.Aspire.Utils;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -48,12 +51,20 @@ public static class RavenDBCloudBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(apiKey);
+        MatchingPackageVersion.Ensure(typeof(RavenDBServerResource), typeof(RavenDBCloudOptions));
 
-        if (!builder.ApplicationBuilder.ExecutionContext.IsPublishMode)
-        {
-            return builder;
-        }
+        return builder.ApplicationBuilder.ExecutionContext.IsPublishMode
+            ? PublishToCloud(builder, apiKey, configure)
+            : builder;
+    }
 
+    // Apart from the version check: its body uses the RavenDB package's internals.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static IResourceBuilder<RavenDBServerResource> PublishToCloud(
+        IResourceBuilder<RavenDBServerResource> builder,
+        IResourceBuilder<ParameterResource> apiKey,
+        Action<RavenDBCloudOptions>? configure)
+    {
         var options = new RavenDBCloudOptions();
         configure?.Invoke(options);
 
@@ -78,7 +89,7 @@ public static class RavenDBCloudBuilderExtensions
             builder.Resource,
             apiKey.Resource,
             options,
-            AppHostName(builder.ApplicationBuilder),
+            AppHostName(builder.ApplicationBuilder.AppHostDirectory, builder.ApplicationBuilder.Environment.ApplicationName),
             builder.ApplicationBuilder.Environment.EnvironmentName);
 
         builder.ApplicationBuilder.Services.TryAddSingleton<IRavenDBCloudApiClientFactory, RavenDBCloudApiClientFactory>();
@@ -118,9 +129,23 @@ public static class RavenDBCloudBuilderExtensions
     }
 
     /// <summary>
-    /// The AppHost's directory: the project of a C# AppHost, the folder of a TypeScript one, whose process is always
-    /// named aspire-managed. It is the same on every machine that checks the repository out.
+    /// The name the repository gives the AppHost: its package name in <c>package.json</c> for a TypeScript AppHost, whose
+    /// process is always named aspire-managed, else its project's name. Both are the same on every machine, whatever
+    /// folder the repository is checked out to.
     /// </summary>
-    private static string AppHostName(IDistributedApplicationBuilder builder) =>
-        Path.GetFileName(Path.TrimEndingDirectorySeparator(builder.AppHostDirectory));
+    internal static string AppHostName(string appHostDirectory, string applicationName)
+    {
+        var packageJson = Path.Combine(appHostDirectory, "package.json");
+
+        if (File.Exists(packageJson) &&
+            JsonNode.Parse(File.ReadAllText(packageJson))?["name"] is JsonValue value &&
+            value.TryGetValue<string>(out var name) &&
+            name.Length > 0)
+        {
+            // A scoped package, @contoso/shop, becomes contoso-shop.
+            return name.TrimStart('@').Replace('/', '-');
+        }
+
+        return applicationName;
+    }
 }

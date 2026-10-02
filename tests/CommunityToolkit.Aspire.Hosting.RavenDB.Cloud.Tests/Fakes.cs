@@ -43,8 +43,16 @@ internal sealed class FakeRavenDBCloudApi : HttpMessageHandler, IRavenDBCloudApi
         return product;
     }
 
+    /// <summary>Answers the next requests with these statuses before handling them, as a busy or failing API does.</summary>
+    public ConcurrentQueue<HttpStatusCode> Failures { get; } = new();
+
+    public List<string> Requests { get; } = [];
+
+    /// <summary>Answers the next product creation with this status, once.</summary>
+    public HttpStatusCode? FailCreation { get; set; }
+
     public RavenDBCloudApiClient Create(string endpoint, string apiKey) =>
-        new(new HttpClient(this, disposeHandler: false), endpoint, apiKey);
+        new(new HttpClient(this, disposeHandler: false), endpoint, apiKey) { RetryDelay = TimeSpan.FromMilliseconds(1) };
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
@@ -60,6 +68,22 @@ internal sealed class FakeRavenDBCloudApi : HttpMessageHandler, IRavenDBCloudApi
         }
 
         var path = request.RequestUri!.AbsolutePath;
+
+        lock (Requests)
+        {
+            Requests.Add($"{request.Method} {path}");
+        }
+
+        if (Failures.TryDequeue(out var failure))
+        {
+            return new HttpResponseMessage(failure);
+        }
+
+        if (request.Method == HttpMethod.Post && path == "/api/v1/products/create" && FailCreation is { } creationFailure)
+        {
+            FailCreation = null;
+            return new HttpResponseMessage(creationFailure);
+        }
 
         if (request.Method == HttpMethod.Get && path == "/api/v1/products/list")
         {
